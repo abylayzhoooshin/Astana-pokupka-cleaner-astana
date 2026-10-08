@@ -1,0 +1,12 @@
+[Unit]
+Description=Consistent backup of the Rieltor stack
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=__STACK_DIR__/scripts/backup.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+PrivateTmp=true
+NoNewPrivileges=true

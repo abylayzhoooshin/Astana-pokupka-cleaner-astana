@@ -1,0 +1,151 @@
+name: rieltor-pokupka
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+  networks:
+    - backend
+
+services:
+  collector:
+    <<: *service-defaults
+    build:
+      context: ${COLLECTOR_REPO_PATH:-/opt/rieltor/repos/collector}
+      dockerfile: Dockerfile
+    image: rieltor-pokupka-collector:local
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DATA_DIR: /app/data
+      KRISHA_DB: /app/data/krisha_astana.db
+      BASELINE_DIR: /app/data/baseline_versions
+      BASELINE_API_HOST: 0.0.0.0
+      BASELINE_API_PORT: "8001"
+      BASELINE_API_KEY: ${COLLECTOR_API_KEY:?Set COLLECTOR_API_KEY in deploy/ovh/.env}
+      BASELINE_STARTUP_GRACE_S: ${BASELINE_STARTUP_GRACE_S:-28800}
+      COLLECTOR_PAUSED: ${COLLECTOR_PAUSED:-1}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - type: bind
+        source: ${DATA_ROOT:-/srv/rieltor}/collector
+        target: /app/data
+    ports:
+      - 127.0.0.1:${COLLECTOR_HOST_PORT:-8001}:8001
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=5).read()"
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 10m
+    stop_grace_period: 3m
+    mem_limit: ${COLLECTOR_MEMORY_LIMIT:-3g}
+    cpus: ${COLLECTOR_CPU_LIMIT:-2.5}
+    pids_limit: 512
+
+  cleaner:
+    <<: *service-defaults
+    build:
+      context: ${CLEANER_REPO_PATH:-/opt/rieltor/repos/cleaner}
+      dockerfile: Dockerfile
+    image: rieltor-pokupka-cleaner:local
+    depends_on:
+      collector:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DATA_DIR: /app/data
+      CLEANER_DB: /app/data/sales_cleaner_astana.db
+      CLEANER_API_HOST: 0.0.0.0
+      CLEANER_API_PORT: "8002"
+      PORT: "8002"
+      CLEANER_API_KEY: ${CLEANER_API_KEY:?Set CLEANER_API_KEY in deploy/ovh/.env}
+      COLLECTOR_URL: http://collector:8001
+      COLLECTOR_API_KEY: ${COLLECTOR_API_KEY:?Set COLLECTOR_API_KEY in deploy/ovh/.env}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY in deploy/ovh/.env}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-6-luna}
+      REASONING_EFFORT: ${REASONING_EFFORT:-medium}
+      MAX_BATCH_SIZE: ${MAX_BATCH_SIZE:-3000}
+      MAX_BATCHES_PER_CYCLE: ${MAX_BATCHES_PER_CYCLE:-10}
+      MIN_BATCH_SIZE: ${MIN_BATCH_SIZE:-999999}
+      PILOT_LIMIT: ${PILOT_LIMIT:-0}
+      MAX_LLM_ATTEMPTS: ${MAX_LLM_ATTEMPTS:-3}
+      CLEANER_CYCLE_INTERVAL_H: ${CLEANER_CYCLE_INTERVAL_H:-12}
+      CLEANER_INGEST_TICK_S: ${CLEANER_INGEST_TICK_S:-300}
+      CLEANER_FULL_RETRY_S: ${CLEANER_FULL_RETRY_S:-900}
+      ENTITY_SHADOW_ENABLED: ${ENTITY_SHADOW_ENABLED:-1}
+      ENTITY_MANUAL_WRITES_ENABLED: ${ENTITY_MANUAL_WRITES_ENABLED:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - type: bind
+        source: ${DATA_ROOT:-/srv/rieltor}/cleaner
+        target: /app/data
+    ports:
+      - 127.0.0.1:${CLEANER_HOST_PORT:-8002}:8002
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=5).read()"
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 15m
+    stop_grace_period: 2m
+    mem_limit: ${CLEANER_MEMORY_LIMIT:-3g}
+    cpus: ${CLEANER_CPU_LIMIT:-2.0}
+    pids_limit: 512
+
+  # This profile is deliberately disabled by default. The only local Main
+  # currently available is calibrated for RENT, not Astana apartment sales.
+  # Enable it only after the purchase consumer has passed its own audit.
+  main:
+    <<: *service-defaults
+    profiles:
+      - purchase-main
+    build:
+      context: ${MAIN_REPO_PATH:-/opt/rieltor/repos/main}
+      dockerfile: Dockerfile
+    image: rieltor-pokupka-main:local
+    depends_on:
+      collector:
+        condition: service_healthy
+      cleaner:
+        condition: service_healthy
+    environment:
+      PYTHONUNBUFFERED: "1"
+      KRISHA_DATA_DIR: /var/data
+      RIELTOR_COLLECTOR_URL: http://collector:8001
+      RIELTOR_COLLECTOR_API_KEY: ${COLLECTOR_API_KEY:?Set COLLECTOR_API_KEY in deploy/ovh/.env}
+      RIELTOR_CLEANER_URL: http://cleaner:8002
+      RIELTOR_CLEANER_API_KEY: ${CLEANER_API_KEY:?Set CLEANER_API_KEY in deploy/ovh/.env}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY in deploy/ovh/.env}
+      OPENAI_MODEL: ${MAIN_OPENAI_MODEL:-gpt-5-mini}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      COLLECTOR_START_FROM: ${COLLECTOR_START_FROM:-end}
+      COLLECTOR_POLL_INTERVAL_SEC: ${COLLECTOR_POLL_INTERVAL_SEC:-60}
+    volumes:
+      - type: bind
+        source: ${DATA_ROOT:-/srv/rieltor}/main
+        target: /var/data
+    stop_grace_period: 2m
+    mem_limit: ${MAIN_MEMORY_LIMIT:-3g}
+    cpus: ${MAIN_CPU_LIMIT:-2.0}
+    pids_limit: 512
+
+networks:
+  backend:
+    driver: bridge

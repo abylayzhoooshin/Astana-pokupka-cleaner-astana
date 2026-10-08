@@ -1,0 +1,9 @@
+[Unit]
+Description=Rieltor stack health and disk check
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=__STACK_DIR__/scripts/healthcheck.sh
+PrivateTmp=true
+NoNewPrivileges=true

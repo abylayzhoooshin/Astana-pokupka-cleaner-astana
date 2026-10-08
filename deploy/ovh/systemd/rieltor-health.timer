@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic Rieltor stack health check
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=5m
+Persistent=true
+Unit=rieltor-health.service
+
+[Install]
+WantedBy=timers.target
