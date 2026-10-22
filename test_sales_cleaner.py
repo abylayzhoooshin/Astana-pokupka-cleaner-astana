@@ -19,6 +19,7 @@ import entity_matcher
 import entity_store
 import heuristics
 import main_assessments
+import main_photo_sync
 import openai_batch
 import pipeline
 import photo_worker
@@ -77,6 +78,20 @@ def candidate_snapshot(version, rows, prices=None, presence=None):
         price_observations=prices,
         presence_events=presence,
     )
+
+
+class PhotoSyncConfigurationTests(unittest.TestCase):
+    def test_existing_cleaner_key_can_authenticate_photo_exchange(self):
+        with mock.patch.dict(os.environ, {
+            "MAINRIELTOR_PHOTO_SYNC_ENABLED": "1",
+            "MAINRIELTOR_URL": "https://pokupka-rieltor-main.onrender.com",
+            "MAINRIELTOR_INTERIOR_API_KEY": "",
+            "CLEANER_API_KEY": "cleaner-key",
+        }):
+            self.assertEqual(
+                ("https://pokupka-rieltor-main.onrender.com", "cleaner-key"),
+                main_photo_sync.configured(),
+            )
 
 
 class SalesRulesTests(unittest.TestCase):

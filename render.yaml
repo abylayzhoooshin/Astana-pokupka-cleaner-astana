@@ -45,8 +45,9 @@ services:
         value: "300"
       - key: CLEANER_FULL_RETRY_S
         value: "900"
-      # Enable after purchase Main is deployed and its exchange key is set.
       - key: MAINRIELTOR_PHOTO_SYNC_ENABLED
-        value: "0"
+        value: "1"
+      - key: MAINRIELTOR_URL
+        value: https://pokupka-rieltor-main.onrender.com
       - key: LOG_LEVEL
         value: INFO

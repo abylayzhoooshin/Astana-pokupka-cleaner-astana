@@ -20,7 +20,8 @@ def configured():
     if os.environ.get("MAINRIELTOR_PHOTO_SYNC_ENABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}:
         return None
     url = os.environ.get("MAINRIELTOR_URL", "").strip().rstrip("/")
-    key = os.environ.get("MAINRIELTOR_INTERIOR_API_KEY", "").strip()
+    key = (os.environ.get("MAINRIELTOR_INTERIOR_API_KEY", "").strip()
+           or os.environ.get("CLEANER_API_KEY", "").strip())
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.query or parsed.fragment or not key:
         raise PhotoSyncError("invalid Main photo exchange configuration")
