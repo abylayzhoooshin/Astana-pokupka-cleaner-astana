@@ -1,4 +1,4 @@
-"""Metadata candidate generation for future photo matching in Main.
+"""Metadata candidate generation for a future versioned photo worker.
 
 Cleaner owns entities and the durable review queue, but it does not download or
 score photographs. This module only narrows the full listing set to plausible
@@ -14,7 +14,14 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 
-CANDIDATE_GENERATOR_VERSION = "sales-metadata-candidates-v3"
+CANDIDATE_GENERATOR_VERSION = "sales-metadata-candidates-v4"
+IGNORED_PHOTO_URL_MARKERS = (
+    "/static/frontend/images/",
+    "photo-moderation",
+    "no-photo",
+    "nophoto",
+    "placeholder",
+)
 IDENTITY_FIELDS = (
     "rooms", "square_m2", "floor", "floor_total", "street", "house_num",
     "complex_id", "complex_alias", "complex_name", "latitude", "longitude",
@@ -42,6 +49,43 @@ def _number(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def usable_photo_urls(row):
+    """Return real source assets, excluding Krisha/system placeholders.
+
+    Collector deliberately preserves what Krisha returned.  Identity matching
+    must be stricter: repeated ``photo-moderation-big.png`` URLs describe the
+    moderation state, not the apartment.  Requiring the URLs as well as the
+    source hash also prevents a hash without inspectable source assets from
+    becoming positive evidence.
+    """
+    value = row.get("photo_urls") or []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(value, list):
+        return []
+    result = []
+    seen = set()
+    for raw_url in value:
+        if not isinstance(raw_url, str):
+            continue
+        url = raw_url.strip()
+        lowered = url.casefold()
+        if not url or any(marker in lowered for marker in IGNORED_PHOTO_URL_MARKERS):
+            continue
+        if url not in seen:
+            result.append(url)
+            seen.add(url)
+    return result
+
+
+def _usable_photo_set_hash(row):
+    value = str(row.get("photo_set_hash") or "")
+    return value if value and usable_photo_urls(row) else ""
 
 
 def identity_hash(row):
@@ -87,8 +131,8 @@ def hard_conflicts(first, second):
 
 def positive_signals(first, second):
     signals = []
-    photo_set_a = str(first.get("photo_set_hash") or "")
-    photo_set_b = str(second.get("photo_set_hash") or "")
+    photo_set_a = _usable_photo_set_hash(first)
+    photo_set_b = _usable_photo_set_hash(second)
     if photo_set_a and photo_set_a == photo_set_b:
         signals.append({"signal": "exact_photo_set"})
     distance = coordinate_distance_meters(first, second)
@@ -131,7 +175,7 @@ def candidate_pairs_with_reasons(rows, max_block=100):
     blocks = defaultdict(list)
     for row in rows:
         listing_id = str(row["id"])
-        photo_set_hash = str(row.get("photo_set_hash") or "")
+        photo_set_hash = _usable_photo_set_hash(row)
         if photo_set_hash:
             blocks[("exact_photo_set", photo_set_hash)].append(listing_id)
         rooms, area, floor = (
@@ -186,7 +230,7 @@ def _priority(reasons, signals, first, second):
 
 
 def refresh_shadow_candidates(conn, rows, source_version):
-    """Persist the current metadata shortlist for later photo analysis in Main."""
+    """Persist the current metadata shortlist for a future photo worker."""
     by_id = {str(row["id"]): row for row in rows}
     pairs = candidate_pairs_with_reasons(rows)
     now = _now()

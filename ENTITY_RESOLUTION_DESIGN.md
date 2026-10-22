@@ -54,16 +54,37 @@ Cleaner не скачивает фотографии, не хранит их б�
 
 ### Фотооценка покупки
 
-Фотообработку следует оставить рядом с будущей оценкой новых объявлений
-покупки. Она получает от Cleaner пару-кандидат, анализирует оригинальные
-цветные фотографии и возвращает версионированные evidence. Это интеграционный
-контракт, а не требование создавать новый сервис в этом репозитории.
+Фотообработку выполняет отдельный процесс `photo_worker.py` из этого репозитория.
+Он получает от Cleaner ограниченную выборку пар-кандидатов через HTTP, скачивает
+оригинальные цветные фотографии, выполняет безопасную нормализацию, строит
+fingerprints, исключает повторные кадры внутри одного объявления и возвращает в
+Cleaner полностью версионированные evidence. Worker не открывает SQLite Cleaner
+и по умолчанию работает как dry-run; запись evidence требует явного `--submit`.
+
+Это временное размещение отдельного worker рядом с контрактом Cleaner, а не
+перенос vision внутрь Cleaner-сервиса. Проверенный арендный Almaty Main умеет
+оценивать общий уровень интерьера, но не возвращает роль каждого кадра. В
+локальном purchase Main такого классификатора также нет. Если общий purchase
+photo-evaluation flow появится, этот worker должен работать рядом с ним и
+передавать evidence в Cleaner по тому же HTTP-контракту; отдельный Sales Main
+только ради entity resolution не требуется.
+
+Это пока только технический shadow-слой. Классификация комнат/фасада/плана,
+распространённость одного photo asset среди разных квартир и откалиброванный
+production-порог ещё не реализованы. Поэтому текущее решение всегда
+`uncertain`, а auto-merge запрещён.
+
+До следующего широкого прогона классификация роли должна выполняться для
+каждого уникального цветного preview и кэшироваться по
+`content_sha256 + photo_role_model_version`. Pair matching допускает только
+совместимые роли. Иначе one-to-one алгоритм способен сопоставить оставшийся
+санузел с кухней и завысить evidence.
 
 ## 3. Что уже реализовано в Cleaner
 
 - стабильные `entity_id` и singleton entity для каждого нового `listing_id`;
 - текущая принадлежность и append-only история принадлежности;
-- локальные price observations и presence events;
+- точные Collector price observations и presence events по `source_event_id`;
 - lifecycle entity, рассчитанный по всем members;
 - транзакционные и идемпотентные merge/split;
 - alias для merge и lineage для split;
@@ -71,13 +92,17 @@ Cleaner не скачивает фотографии, не хранит их б�
 - metadata shortlist дублей без автоматического merge;
 - очередь review через API;
 - приём полностью версионированных photo evidence;
+- ограниченный shadow photo worker с локальным кэшем RGB-preview и dry-run по
+  умолчанию;
 - ручные решения `same_entity`/`different_entity`;
 - публикация одной целой строки на entity;
 - регрессионные тесты миграций, истории, canonical, evidence и overrides.
 
-Текущий вход Cleaner всё ещё `/baseline/table`, поэтому он видит уже
-дедуплицированный Collector baseline. Полная точность возможна только после
-реализации candidate snapshot в Collector.
+Cleaner читает `/baseline/candidates/meta`, фиксирует immutable `version` и с
+ней получает listings, price observations и presence events. `photo_urls`
+восстанавливаются Collector из `listing_photos` той же версии; сумма
+`photo_count` сверяется с `photos_total`. Старый `/baseline/table` больше не
+используется рабочим циклом Cleaner.
 
 ## 4. Окончательный Collector → Cleaner контракт
 
@@ -192,7 +217,8 @@ price_change и восстановленные исторические агре
 
 Cleaner строит shortlist, а не выносит окончательный вердикт. Текущие причины:
 
-- одинаковый `photo_set_hash` URL;
+- одинаковый `photo_set_hash` реальных URL; Krisha placeholder
+  вроде `photo-moderation-big.png` игнорируется;
 - точный адрес + комнаты + округлённая площадь + этаж;
 - ЖК + комнаты + округлённая площадь + этаж;
 - близкая координатная ячейка вместе со структурными полями.
@@ -248,13 +274,13 @@ matcher_version
 
 Из этих полей считается `match_revision_hash`. Изменение любого входного
 набора или алгоритма создаёт новую revision; предыдущая остаётся для аудита.
-Main обязан вернуть `candidate_revision_hash`, `identity_hash` и
+Photo worker обязан вернуть `candidate_revision_hash`, `identity_hash` и
 `photo_set_hash`, которые получил из review job. Если candidate или фотографии
 уже изменились, Cleaner отвечает HTTP 409, не сохраняет устаревший результат и
 оставляет новую revision в `awaiting_photo_analysis`.
 Полный evidence JSON сохраняется. Высокий score сейчас не запускает merge.
 
-Минимальный write-контракт Main → Cleaner:
+Минимальный write-контракт photo worker → Cleaner:
 
 ```json
 {
@@ -358,37 +384,41 @@ lineage и событие с полным составом перемещённ�
 
 ## 11. Результаты анализа текущего Collector
 
-Read-only анализ live snapshot версии `130375733c39f388` дал 21 550 строк:
+Read-only анализ candidate version `72698201052e2eb0` на production-копии дал:
 
-- 13 560 active и 7 990 missing;
-- 1 587 объявлений со снижением цены;
-- 1 400 объявлений с reactivation;
-- 5 196 metadata candidate pairs;
-- 2 880 пар без metadata conflict, ожидающих фотоанализ;
-- 2 316 пар со структурными конфликтами;
-- 1 840 active–active пар.
+- 60 893 listings, 40 463 active и 20 430 missing после технической валидации;
+- 99 028 metadata candidate pairs;
+- 65 615 пар без metadata conflict, ожидающих фотоанализ;
+- 33 413 пар со структурными конфликтами;
+- 28 117 active–active пар во всём shortlist;
+- 6 383 пары в первом photo-пилоте: оба active, оба baseline eligible,
+  минимум три metadata reason.
 
-Нашлись пары с одинаковым набором photo URL, но очень разными ценами. Это
-подтверждает, что `exact_photo_set` нельзя считать готовым auto-link правилом.
-Повторить анализ без OpenAI и без записи в production DB:
+Все 266 пар со старым `exact_photo_set` оказались служебной картинкой
+Krisha `photo-moderation-big.png`, а не фотографиями квартир. Matcher v4 их
+игнорирует. Полный замер трафика и слоёв очереди находится в
+`PHOTO_QUEUE_ANALYSIS.md`. Повторить анализ без OpenAI и без записи в DB:
 
 ```powershell
-.venv\Scripts\python.exe entity_check.py
+.venv\Scripts\python.exe photo_queue_report.py --db <cleaner.db>
 ```
 
 ## 12. Порядок безопасного внедрения
 
 1. Cleaner работает в shadow и накапливает кандидатов — реализовано.
-2. Collector добавляет immutable pre-dedupe candidate snapshot.
-3. Cleaner переключается на новый snapshot, старый контракт остаётся fallback.
-4. Фотооценка покупки читает review candidates и возвращает evidence.
-5. На production-парах формируется ручная truth-выборка.
-6. Измеряются precision/recall по типам квартир, ЖК и фото.
-7. Порог auto-link принимается только после согласования допустимой ошибки.
-8. Потребитель baseline проверяется на `entity_id` и merge; аварийный split
+2. Collector добавляет immutable pre-dedupe candidate snapshot — реализовано.
+3. Cleaner читает только version-pinned candidate snapshot без fallback на legacy —
+   реализовано.
+4. Placeholder-фото игнорируются, photo queue фильтруется — реализовано.
+5. Photo worker читает review candidates и возвращает uncalibrated evidence —
+   технический fingerprint-слой реализован, классификация ролей ещё нет.
+6. На production-парах формируется ручная truth-выборка.
+7. Измеряются precision/recall по типам квартир, ЖК и фото.
+8. Порог auto-link принимается только после согласования допустимой ошибки.
+9. Потребитель baseline проверяется на `entity_id` и merge; аварийный split
    тестируется отдельно как recovery-сценарий.
-9. Включается entity baseline с периодом отката.
-10. Только после этого Collector отключает старую дедупликацию.
+10. Включается entity baseline с периодом отката.
+11. Только после этого Collector отключает старую дедупликацию.
 
 ## 13. Открытые продуктовые решения
 

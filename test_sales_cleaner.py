@@ -1,22 +1,27 @@
 import copy
+import io
 import json
 import logging
 import os
 import sqlite3
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import requests
 from fastapi import HTTPException
+from PIL import Image
 
 import cleaner_db
 import collector_client
 import entity_matcher
 import entity_store
 import heuristics
+import main_assessments
 import openai_batch
 import pipeline
+import photo_worker
 import service
 import verdicts_api
 
@@ -35,10 +40,12 @@ def row(listing_id="1", **changes):
         "floor_total": 12,
         "price": 42_000_000,
         "status": "active",
+        "seller_type": "professional",
         "last_seen_at": "2026-10-05T00:00:00+00:00",
         "photo_urls": "[]",
         "photo_count": 0,
         "photo_set_hash": None,
+        "baseline_eligible": 1,
     }
     value.update(changes)
     return value
@@ -50,7 +57,26 @@ def collector_stub(listing_id):
         "photo_urls": "[]",
         "photo_count": 0,
         "photo_set_hash": None,
+        "baseline_eligible": 1,
     }
+
+
+def candidate_snapshot(version, rows, prices=None, presence=None):
+    prices = prices or []
+    presence = presence or []
+    return collector_client.CandidateSnapshot(
+        version=version,
+        meta={
+            "version": version,
+            "listings_total": len(rows),
+            "photos_total": sum(int(item.get("photo_count") or 0) for item in rows),
+            "price_observations_total": len(prices),
+            "presence_events_total": len(presence),
+        },
+        rows=rows,
+        price_observations=prices,
+        presence_events=presence,
+    )
 
 
 class SalesRulesTests(unittest.TestCase):
@@ -77,7 +103,6 @@ class ContentIdentityTests(unittest.TestCase):
         changed.update(
             price=30_000_000,
             status="missing",
-            floor=9,
             last_seen_at="2026-11-01T00:00:00+00:00",
             photo_set_hash="b" * 64,
         )
@@ -95,6 +120,13 @@ class ContentIdentityTests(unittest.TestCase):
             "priv_dorm": "да",
             "square_m2": 61.0,
             "rooms": 3,
+            "floor": 9,
+            "floor_total": 20,
+            "street": "Другая улица",
+            "house_num": "99",
+            "complex_id": "different-complex",
+            "complex_name": "Другой ЖК",
+            "furniture": "частично",
         }.items():
             changed = copy.deepcopy(original)
             changed[field] = value
@@ -104,11 +136,24 @@ class ContentIdentityTests(unittest.TestCase):
                 field,
             )
 
+    def test_catalog_card_does_not_change_collector_content_identity(self):
+        card = {"name": "ЖК", "complex_status": "commissioned"}
+        self.assertEqual(
+            collector_client.content_hash(row()),
+            collector_client.content_hash(row(complex_card=card)),
+        )
+
     def test_formatted_model_input_excludes_price_and_floor(self):
         text = openai_batch._format_listing("1", row())
         self.assertNotIn("42000000", text)
         self.assertNotIn("этаж 5/12", text)
         self.assertIn("Комнат: 2", text)
+
+    def test_long_description_keeps_late_price_conditions(self):
+        listing = row(full_description="О" * 2200 + " Цена за квадратный метр, несколько квартир")
+        text = openai_batch._format_listing("1", listing)
+        self.assertIn("Цена за квадратный метр, несколько квартир", text)
+        self.assertIn("[…]", text)
 
     def test_photo_identity_matches_collector_algorithm(self):
         urls = ["https://img/2.jpg", "https://img/1.jpg"]
@@ -159,7 +204,7 @@ class SnapshotTests(unittest.TestCase):
         cleaner_db.DB_PATH = self.old_path
         self.temp.cleanup()
 
-    def test_missing_and_unknown_are_published_but_rejected_is_not(self):
+    def test_missing_is_published_but_unknown_and_rejected_are_not(self):
         rows = [
             row("ok", status="missing"),
             row("bad"),
@@ -185,8 +230,8 @@ class SnapshotTests(unittest.TestCase):
             result = pipeline.publish_clean_baseline(conn, rows, "v1")
             published = list(cleaner_db.iter_clean_baseline(conn))
 
-        self.assertEqual(2, result["published"])
-        self.assertEqual({"ok", "unknown"}, {item["id"] for item in published})
+        self.assertEqual(1, result["published"])
+        self.assertEqual({"ok"}, {item["id"] for item in published})
         self.assertEqual("missing", next(item for item in published if item["id"] == "ok")["status"])
 
     def test_empty_rebuild_keeps_previous_snapshot(self):
@@ -332,7 +377,7 @@ class DurableStateTests(unittest.TestCase):
             stored = conn.execute(
                 "SELECT policy_version FROM verdicts WHERE id='1'"
             ).fetchone()[0]
-        self.assertEqual("sales-astana-v1", stored)
+            self.assertEqual(openai_batch.POLICY_VERSION, stored)
 
 
 class EntityStoreTests(unittest.TestCase):
@@ -445,6 +490,45 @@ class EntityStoreTests(unittest.TestCase):
             (44_000_000.0, "observed_change", 1),
         ], observations)
         self.assertEqual((50_000_000.0, 44_000_000.0, 2), tuple(state))
+
+    def test_collector_history_is_idempotent_and_conflicts_fail_closed(self):
+        listing = row("source-history")
+        prices = [{
+            "source_event_id": "price-source-1", "listing_id": "source-history",
+            "observed_at": "2026-10-01T00:00:00+00:00", "price": 50_000_000,
+            "event_type": "initial_price", "history_complete": 0,
+        }]
+        presence = [{
+            "source_event_id": "presence-source-1", "listing_id": "source-history",
+            "event_type": "bootstrap_state", "status_after": "active",
+            "observed_at": "2026-10-01T00:00:00+00:00",
+            "history_complete": 0,
+        }]
+        with cleaner_db.connect() as conn:
+            entity_store.ingest_candidate_history(
+                conn, "candidate-v1", [listing], prices, presence,
+            )
+            entity_store.observe_listings(
+                conn, [listing], "candidate-v1", collector_client.content_hash,
+                source_history=True,
+            )
+            entity_store.ingest_candidate_history(
+                conn, "candidate-v1", [listing], prices, presence,
+            )
+            self.assertEqual(1, conn.execute(
+                "SELECT COUNT(*) FROM collector_price_events"
+            ).fetchone()[0])
+            self.assertEqual(1, conn.execute(
+                "SELECT COUNT(*) FROM collector_presence_events"
+            ).fetchone()[0])
+            self.assertEqual(0, conn.execute(
+                "SELECT COUNT(*) FROM listing_price_observations"
+            ).fetchone()[0])
+            conflicting = [dict(prices[0], price=49_000_000)]
+            with self.assertRaisesRegex(ValueError, "source event conflict"):
+                entity_store.ingest_candidate_history(
+                    conn, "candidate-v2", [listing], conflicting, presence,
+                )
 
     def test_merge_keeps_members_and_publishes_one_whole_active_row(self):
         old = row(
@@ -650,6 +734,198 @@ class EntityStoreTests(unittest.TestCase):
         self.assertEqual(child, resolved_old_c_entity)
 
 
+class PhotoWorkerTests(unittest.TestCase):
+    @staticmethod
+    def asset(name, *, content=None, dhash="0000000000000000", rgb=0):
+        return photo_worker.AssetEvidence(
+            source_url=f"https://krisha-photos.kcdn.online/{name}.jpg",
+            source_url_hash=name,
+            content_sha256=content or name,
+            width=64,
+            height=64,
+            dhash64=dhash,
+            rgb8=tuple([rgb] * 192),
+            preview_path=f"cache/{name}.jpg",
+        )
+
+    def test_normalization_keeps_rgb_and_bounds_dimensions(self):
+        source = Image.new("RGB", (1200, 600), (220, 30, 20))
+        raw = io.BytesIO()
+        source.save(raw, format="JPEG")
+        normalized = photo_worker.normalize_image(raw.getvalue())
+        self.assertEqual("RGB", normalized.mode)
+        self.assertEqual((512, 256), normalized.size)
+        self.assertEqual(64, len(photo_worker.dhash64(normalized)) * 4)
+        self.assertEqual(192, len(photo_worker.rgb8_vector(normalized)))
+
+    def test_intra_listing_dedupe_handles_exact_and_near_frames(self):
+        original = self.asset("a", content="same", rgb=10)
+        exact = self.asset("b", content="same", rgb=200)
+        near = self.asset("c", content="different", dhash="0000000000000001", rgb=11)
+        distinct = self.asset("d", content="unique", dhash="ffffffffffffffff", rgb=240)
+        kept, duplicates = photo_worker.dedupe_assets(
+            [original, exact, near, distinct]
+        )
+        self.assertEqual(["a", "d"], [item.source_url_hash for item in kept])
+        self.assertEqual(
+            ["content_sha256", "near_perceptual"],
+            [item["reason"] for item in duplicates],
+        )
+
+    def test_pair_matching_is_one_to_one_and_remains_uncertain(self):
+        first = [self.asset("a1", rgb=10), self.asset("a2", rgb=20)]
+        second = [self.asset("b1", rgb=12)]
+        matches = photo_worker.one_to_one_matches(first, second)
+        self.assertEqual(1, len(matches))
+        self.assertEqual(1, len({item["right_asset"] for item in matches}))
+
+        class FakeCache:
+            def __init__(self, values):
+                self.values = values
+
+            def get(self, url):
+                return self.values[url]
+
+        url_a = "https://krisha-photos.kcdn.online/a.jpg"
+        url_b = "https://krisha-photos.kcdn.online/b.jpg"
+        candidate = {
+            "listing_id_low": "a",
+            "listing_id_high": "b",
+            "candidate_revision_hash": "revision",
+            "low_identity_hash": "identity-a",
+            "high_identity_hash": "identity-b",
+            "listing_low": row(
+                "a", photo_urls=json.dumps([url_a]), photo_count=1,
+                photo_set_hash="set-a",
+            ),
+            "listing_high": row(
+                "b", photo_urls=json.dumps([url_b]), photo_count=1,
+                photo_set_hash="set-b",
+            ),
+        }
+        evidence = photo_worker.build_pair_evidence(
+            candidate,
+            FakeCache({url_a: first[0], url_b: second[0]}),
+            max_photos=5,
+        )
+        self.assertEqual("uncertain", evidence["decision"])
+        self.assertFalse(evidence["calibrated"])
+        self.assertFalse(evidence["auto_merge_allowed"])
+        self.assertEqual(1, len(evidence["matches"]))
+        self.assertNotIn("preview_path", evidence["listing_a"]["assets"][0])
+
+    def test_photo_url_policy_rejects_non_https_and_other_hosts(self):
+        with self.assertRaises(photo_worker.PhotoWorkerError):
+            photo_worker._validate_public_url(
+                "http://krisha-photos.kcdn.online/a.jpg",
+                photo_worker.DEFAULT_ALLOWED_HOSTS,
+                resolve_dns=False,
+            )
+        with self.assertRaises(photo_worker.PhotoWorkerError):
+            photo_worker._validate_public_url(
+                "https://127.0.0.1/a.jpg",
+                photo_worker.DEFAULT_ALLOWED_HOSTS,
+                resolve_dns=False,
+            )
+
+    def test_compact_overview_and_atomic_report_keep_full_results(self):
+        result = {
+            "queue_total": 10,
+            "selected": 3,
+            "analyzed": 2,
+            "submitted": 0,
+            "failed": 1,
+            "dry_run": True,
+            "selection": "stratified",
+            "strata": [{"name": "active_strong", "selected": 1}],
+            "results": [
+                {
+                    "pair": ["a", "b"], "score": 0.99,
+                    "photo_stats": {
+                        "source_urls_considered": 10,
+                        "downloaded_assets": 9,
+                        "unique_assets": 8,
+                        "intra_listing_duplicates": 1,
+                        "download_errors": 1,
+                    },
+                },
+                {
+                    "pair": ["c", "d"], "score": 0.65,
+                    "photo_stats": {
+                        "source_urls_considered": 4,
+                        "downloaded_assets": 4,
+                        "unique_assets": 4,
+                        "intra_listing_duplicates": 0,
+                        "download_errors": 0,
+                    },
+                },
+                {"pair": ["e", "f"], "error": "no usable photo"},
+            ],
+        }
+        overview = photo_worker.run_overview(result)
+        self.assertEqual(0.82, overview["score_summary"]["median"])
+        self.assertEqual(1, overview["score_summary"]["at_least_0_98"])
+        self.assertEqual(14, overview["photo_totals"]["source_urls_considered"])
+        self.assertEqual(1, len(overview["errors"]))
+        self.assertEqual("stratified", overview["selection"])
+        self.assertNotIn("results", overview)
+
+        with tempfile.TemporaryDirectory() as temp:
+            target = os.path.join(temp, "reports", "photo.json")
+            written = photo_worker.write_json_report(target, result)
+            self.assertTrue(Path(written).samefile(target))
+            with open(target, encoding="utf-8") as handle:
+                self.assertEqual(result, json.load(handle))
+            self.assertEqual([], list(Path(temp).rglob("*.tmp")))
+
+    def test_stratified_profile_allocates_exact_reproducible_500_pairs(self):
+        strata = photo_worker.stratified_quotas(500)
+        self.assertEqual(500, sum(item["requested"] for item in strata))
+        self.assertEqual(9, len(strata))
+        self.assertEqual(100, strata[0]["requested"])
+        self.assertEqual(25, strata[-1]["requested"])
+        self.assertEqual(
+            {"both_active", "active_missing", "both_missing"},
+            {item["activity"] for item in strata},
+        )
+        self.assertEqual({1, 2, 3}, {item["reason_count"] for item in strata})
+
+    def test_stratified_fetch_marks_each_candidate_with_its_tier(self):
+        class FakeResponse:
+            status_code = 200
+            text = ""
+
+            def __init__(self, params):
+                self.params = params
+
+            def json(self):
+                reason = self.params["reason_count"]
+                activity = self.params["activity"]
+                return {
+                    "total": 1000,
+                    "rows": [{
+                        "listing_id_low": f"{activity}-{reason}-a",
+                        "listing_id_high": f"{activity}-{reason}-b",
+                    }],
+                }
+
+        class FakeSession:
+            def request(self, _method, _url, **kwargs):
+                return FakeResponse(kwargs["params"])
+
+        rows, total, strata = photo_worker.fetch_stratified_candidates(
+            FakeSession(), "http://cleaner", "key", limit=500,
+            eligibility="both",
+        )
+        self.assertEqual(9, len(rows))
+        self.assertEqual(9000, total)
+        self.assertEqual(9, len(strata))
+        self.assertEqual(
+            [item["name"] for item in strata],
+            [item["_selection_stratum"] for item in rows],
+        )
+
+
 class EntityMatcherTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -674,6 +950,52 @@ class EntityMatcherTests(unittest.TestCase):
             item["signal"] == "near_coordinates"
             for item in entity_matcher.positive_signals(first, second)
         ))
+
+    def test_photo_placeholder_is_never_an_identity_signal(self):
+        placeholder = "https://krisha.kz/static/frontend/images/photo-moderation-big.png"
+        rows = [
+            row(
+                "a", rooms=None, square_m2=None, floor=None,
+                photo_urls=json.dumps([placeholder, placeholder]),
+                photo_count=2, photo_set_hash="same-placeholder-set",
+            ),
+            row(
+                "b", rooms=None, square_m2=None, floor=None,
+                photo_urls=json.dumps([placeholder, placeholder]),
+                photo_count=2, photo_set_hash="same-placeholder-set",
+            ),
+        ]
+        self.assertEqual({}, entity_matcher.candidate_pairs_with_reasons(rows))
+        self.assertNotIn(
+            "exact_photo_set",
+            {item["signal"] for item in entity_matcher.positive_signals(*rows)},
+        )
+
+    def test_real_exact_photo_set_remains_a_candidate_signal(self):
+        urls = [
+            "https://photos.example/room-1.jpg",
+            "https://photos.example/room-2.jpg",
+        ]
+        rows = [
+            row(
+                "a", rooms=None, square_m2=None, floor=None,
+                photo_urls=json.dumps(urls), photo_count=2,
+                photo_set_hash="same-real-set",
+            ),
+            row(
+                "b", rooms=None, square_m2=None, floor=None,
+                photo_urls=json.dumps(urls), photo_count=2,
+                photo_set_hash="same-real-set",
+            ),
+        ]
+        self.assertEqual(
+            {("a", "b"): ["exact_photo_set"]},
+            entity_matcher.candidate_pairs_with_reasons(rows),
+        )
+        self.assertIn(
+            "exact_photo_set",
+            {item["signal"] for item in entity_matcher.positive_signals(*rows)},
+        )
 
     def test_shadow_candidates_are_durable_and_never_auto_merge(self):
         rows = [
@@ -700,6 +1022,19 @@ class EntityMatcherTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM property_entities"
             ).fetchone()[0]
             total, review = entity_store.match_candidates_page(conn)
+            filtered_total, filtered = entity_store.match_candidates_page(
+                conn, status="awaiting_photo_analysis", min_priority=80,
+                min_reason_count=3, activity="both_active", eligibility="both",
+            )
+            exact_total, exact = entity_store.match_candidates_page(
+                conn, status="awaiting_photo_analysis", reason_count=3,
+                activity="both_active", eligibility="both",
+                order_by="revision_hash",
+            )
+            wrong_level_total, _ = entity_store.match_candidates_page(
+                conn, status="awaiting_photo_analysis", reason_count=2,
+                order_by="revision_hash",
+            )
 
         self.assertEqual(1, first["current_candidates"])
         self.assertEqual(0, first["auto_merged"])
@@ -710,6 +1045,13 @@ class EntityMatcherTests(unittest.TestCase):
         self.assertEqual(2, entities)
         self.assertEqual(1, total)
         self.assertEqual("100", review[0]["listing_low"]["id"])
+        self.assertEqual(1, filtered_total)
+        self.assertEqual("both_active", filtered[0]["queue_facts"]["activity"])
+        self.assertEqual(2, filtered[0]["queue_facts"]["baseline_eligible_count"])
+        self.assertEqual(3, filtered[0]["queue_facts"]["reason_count"])
+        self.assertEqual(1, exact_total)
+        self.assertEqual("100", exact[0]["listing_low"]["id"])
+        self.assertEqual(0, wrong_level_total)
 
     def test_photo_evidence_pair_is_canonical_and_versions_create_revisions(self):
         rows = [
@@ -752,6 +1094,10 @@ class EntityMatcherTests(unittest.TestCase):
                                    "listing_a": evidence["listing_b"],
                                    "listing_b": evidence["listing_a"]},
             )
+            evidence_total, evidence_rows = entity_store.match_candidates_page(
+                conn, status="photo_evidence_ready", photo_decision="likely_same",
+                min_score=0.9, max_score=0.95,
+            )
             refreshed = entity_matcher.refresh_shadow_candidates(conn, rows, "v2")
             revisions = [tuple(item) for item in conn.execute(
                 "SELECT listing_id_low,listing_id_high,fingerprint_version,is_current "
@@ -766,6 +1112,11 @@ class EntityMatcherTests(unittest.TestCase):
         ))
         self.assertEqual(first["match_revision_hash"], repeat["match_revision_hash"])
         self.assertNotEqual(first["match_revision_hash"], changed["match_revision_hash"])
+        self.assertEqual(1, evidence_total)
+        self.assertEqual(0.91, evidence_rows[0]["photo_evidence"]["score"])
+        self.assertEqual(
+            "f2", evidence_rows[0]["photo_evidence"]["fingerprint_version"],
+        )
         self.assertEqual([
             ("a", "b", "f1", 0), ("a", "b", "f2", 1),
         ], revisions)
@@ -901,7 +1252,8 @@ class FullCycleTests(unittest.TestCase):
             conn.commit()
 
         with mock.patch.object(
-            collector_client, "fetch_all_rows", return_value=("collector-v2", [good, partial])
+            collector_client, "fetch_candidate_snapshot",
+            return_value=candidate_snapshot("collector-v2", [good, partial]),
         ), mock.patch.object(openai_batch, "submit_batch") as paid_submit:
             result = pipeline.run_cycle()
 
@@ -916,10 +1268,94 @@ class FullCycleTests(unittest.TestCase):
         self.assertEqual(["good"], [item["id"] for item in clean])
         self.assertEqual(("partial_property", "sales-astana-v1"), tuple(verdict))
 
+    def test_cycle_reuses_main_price_verdict_without_paid_batch(self):
+        listing = row("main-ready")
+        with cleaner_db.connect() as conn:
+            main_assessments.save(conn, {
+                "listing_id": listing["id"],
+                "text": {
+                    "content_hash": collector_client.content_hash(listing),
+                    "evaluator_version": main_assessments.DEFAULT_TEXT_VERSION,
+                    "result": {
+                        "sale_profile": {"offer_type": "whole_apartment", "claims": []},
+                        "comparison_policy_version": main_assessments.COMPARISON_POLICY_VERSION,
+                        "assessment_context": {
+                            "price": listing.get("price"),
+                            "photo_set_hash": listing.get("photo_set_hash"),
+                            "furniture": listing.get("furniture"),
+                        },
+                        "comparison_verdict": {
+                            "usable": True, "reason_code": "ok", "confidence": "medium",
+                            "evidence": "",
+                        },
+                    },
+                },
+            })
+            conn.commit()
+
+        with mock.patch.object(
+            collector_client, "fetch_candidate_snapshot",
+            return_value=candidate_snapshot("collector-v2", [listing]),
+        ), mock.patch.object(openai_batch, "submit_batch") as paid_submit:
+            result = pipeline.run_cycle()
+
+        paid_submit.assert_not_called()
+        self.assertEqual(1, result["resolved_main"])
+        self.assertEqual(0, result["submitted_listings"])
+        self.assertEqual(1, result["published"])
+        with cleaner_db.connect() as conn:
+            verdict = conn.execute(
+                "SELECT source, policy_version FROM verdicts WHERE id=?", (listing["id"],)
+            ).fetchone()
+        self.assertEqual(("main", main_assessments.COMPARISON_POLICY_VERSION), tuple(verdict))
+
+    def test_candidate_ineligible_row_is_identity_only_not_published(self):
+        eligible = row("eligible")
+        owner = row("owner", baseline_eligible=0)
+        with cleaner_db.connect() as conn:
+            for listing in (eligible, owner):
+                cleaner_db.upsert_verdict(
+                    conn, listing["id"], collector_client.content_hash(listing),
+                    {"usable": True, "reason_code": "ok", "confidence": "high",
+                     "reason": "", "source": "llm"}, "old",
+                    policy_version=openai_batch.POLICY_VERSION,
+                )
+            conn.commit()
+
+        with mock.patch.object(
+            collector_client, "fetch_candidate_snapshot",
+            return_value=candidate_snapshot("candidate-v1", [eligible, owner]),
+        ), mock.patch.object(openai_batch, "submit_batch") as paid_submit:
+            result = pipeline.run_cycle()
+
+        paid_submit.assert_not_called()
+        self.assertEqual(2, result["total"])
+        self.assertEqual(1, result["baseline_eligible"])
+        self.assertEqual(1, result["published"])
+        with cleaner_db.connect() as conn:
+            self.assertEqual(2, conn.execute(
+                "SELECT COUNT(*) FROM entity_members"
+            ).fetchone()[0])
+            self.assertEqual(["eligible"], [
+                item["id"] for item in cleaner_db.iter_clean_baseline(conn)
+            ])
+
+    def test_owner_and_unknown_sellers_are_not_price_comparables(self):
+        professional = row("pro", seller_type="professional")
+        owner = row("owner", seller_type="owner")
+        unknown = row("unknown", seller_type=None)
+        self.assertEqual(
+            ["pro"],
+            [r["id"] for r in pipeline._comparison_rows(
+                [professional, owner, unknown]
+            )],
+        )
+
     def test_unchanged_listing_is_submitted_only_once_while_batch_is_pending(self):
         listing = row("ai-needed")
         with mock.patch.object(
-            collector_client, "fetch_all_rows", return_value=("collector-v1", [listing])
+            collector_client, "fetch_candidate_snapshot",
+            return_value=candidate_snapshot("collector-v1", [listing]),
         ), mock.patch.object(openai_batch, "submit_batch", return_value="batch-1") as submit, \
                 mock.patch.object(
                     openai_batch, "check_batch",
@@ -954,7 +1390,8 @@ class FullCycleTests(unittest.TestCase):
             pipeline.publish_clean_baseline(conn, [existing], "collector-v1")
 
         with mock.patch.object(
-            collector_client, "fetch_all_rows", side_effect=requests.Timeout("temporary")
+            collector_client, "fetch_candidate_snapshot",
+            side_effect=requests.Timeout("temporary"),
         ), mock.patch.object(pipeline, "ingest_completed_batches", return_value=0):
             result = pipeline.run_cycle()
 
@@ -1058,6 +1495,84 @@ class CollectorPaginationTests(unittest.TestCase):
         self.assertEqual("new", version)
         self.assertEqual(["new"], [item["id"] for item in rows])
         self.assertEqual([0, 500, 0], offsets)
+
+
+class CandidateCollectorContractTests(unittest.TestCase):
+    def test_candidate_download_pins_version_and_includes_source_histories(self):
+        listing = collector_stub("1")
+        price = {
+            "source_event_id": "price-1", "listing_id": "1",
+            "observed_at": "2026-10-01T00:00:00+00:00", "price": 10,
+            "event_type": "initial_price", "history_complete": 0,
+        }
+        presence = {
+            "source_event_id": "presence-1", "listing_id": "1",
+            "event_type": "bootstrap_state", "status_after": "active",
+            "observed_at": "2026-10-01T00:00:00+00:00",
+            "history_complete": 0,
+        }
+        meta = {
+            "version": "candidate-v1", "listings_total": 1, "photos_total": 0,
+            "price_observations_total": 1, "presence_events_total": 1,
+        }
+        payloads = {
+            "/baseline/candidates/meta": meta,
+            "/baseline/candidates/listings": {
+                "version": "candidate-v1", "total": 1, "rows": [listing],
+            },
+            "/baseline/candidates/prices": {
+                "version": "candidate-v1", "total": 1, "rows": [price],
+            },
+            "/baseline/candidates/presence": {
+                "version": "candidate-v1", "total": 1, "rows": [presence],
+            },
+        }
+        requested = []
+
+        def fake_get(url, **_kwargs):
+            path = url.removeprefix("https://collector")
+            requested.append(path)
+            return _Response(payloads[path])
+
+        with mock.patch.object(collector_client, "COLLECTOR_URL", "https://collector"), \
+                mock.patch.object(collector_client.requests, "get", side_effect=fake_get):
+            snapshot = collector_client.fetch_candidate_snapshot()
+
+        self.assertEqual("candidate-v1", snapshot.version)
+        self.assertEqual([price], snapshot.price_observations)
+        self.assertEqual([presence], snapshot.presence_events)
+        self.assertNotIn("/baseline/candidates/photos", requested)
+
+    def test_candidate_download_rejects_event_for_absent_listing(self):
+        listing = collector_stub("1")
+        meta = {
+            "version": "v1", "listings_total": 1, "photos_total": 0,
+            "price_observations_total": 1, "presence_events_total": 0,
+        }
+        payloads = {
+            "/baseline/candidates/meta": meta,
+            "/baseline/candidates/listings": {
+                "version": "v1", "total": 1, "rows": [listing],
+            },
+            "/baseline/candidates/prices": {
+                "version": "v1", "total": 1, "rows": [{
+                    "source_event_id": "bad", "listing_id": "absent",
+                    "observed_at": "2026-10-01T00:00:00+00:00", "price": 10,
+                    "event_type": "initial_price", "history_complete": 0,
+                }],
+            },
+        }
+
+        def fake_get(url, **_kwargs):
+            path = url.removeprefix("https://collector")
+            if path == "/baseline/candidates/presence":
+                raise AssertionError("zero-total endpoint must not be requested")
+            return _Response(payloads[path])
+
+        with mock.patch.object(collector_client, "COLLECTOR_URL", "https://collector"), \
+                mock.patch.object(collector_client.requests, "get", side_effect=fake_get):
+            with self.assertRaisesRegex(collector_client.CollectorError, "absent listing"):
+                collector_client.fetch_candidate_snapshot()
 
 
 class HealthTests(unittest.TestCase):

@@ -18,14 +18,20 @@ import entity_store
 
 def main():
     started = time.time()
-    version, rows = collector_client.fetch_all_rows()
+    snapshot = collector_client.fetch_candidate_snapshot()
+    version, rows = snapshot.version, snapshot.rows
     fetched_at = time.time()
 
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     entity_store.create_schema(conn)
+    source_history = entity_store.ingest_candidate_history(
+        conn, version, rows,
+        snapshot.price_observations, snapshot.presence_events,
+    )
     observed = entity_store.observe_listings(
         conn, rows, version, collector_client.content_hash,
+        source_history=True,
     )
     candidates = entity_matcher.refresh_shadow_candidates(conn, rows, version)
     conn.commit()
@@ -64,6 +70,7 @@ def main():
 
     output = {
         "collector_version": version,
+        "source_history": source_history,
         "rows": len(rows),
         "active": sum(row.get("status") == "active" for row in rows),
         "missing": sum(row.get("status") == "missing" for row in rows),

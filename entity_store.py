@@ -13,7 +13,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 
-ENTITY_SCHEMA_VERSION = "entity-store-v3"
+ENTITY_SCHEMA_VERSION = "entity-store-v4"
 ENTITY_GRACE_HOURS = float(os.environ.get("ENTITY_GRACE_HOURS", "24"))
 IDENTITY_SNAPSHOT_FIELDS = (
     "id", "url", "title", "status", "price", "initial_price",
@@ -22,6 +22,7 @@ IDENTITY_SNAPSHOT_FIELDS = (
     "complex_name", "latitude", "longitude", "seller_type", "owner_name",
     "first_seen_at", "last_seen_at", "missing_detected_at",
     "reactivation_count", "photo_urls", "photo_count", "photo_set_hash",
+    "baseline_eligible", "baseline_reject_reason",
 )
 
 
@@ -135,6 +136,40 @@ def create_schema(conn):
         );
         CREATE INDEX IF NOT EXISTS idx_presence_listing_time
             ON listing_presence_events(listing_id, observed_at, local_event_id);
+
+        CREATE TABLE IF NOT EXISTS collector_price_events (
+            source_event_id TEXT PRIMARY KEY,
+            listing_id TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            price REAL NOT NULL,
+            event_type TEXT NOT NULL,
+            history_complete INTEGER NOT NULL,
+            first_source_version TEXT NOT NULL,
+            event_hash TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_collector_price_listing_time
+            ON collector_price_events(listing_id, observed_at, source_event_id);
+
+        CREATE TABLE IF NOT EXISTS collector_presence_events (
+            source_event_id TEXT PRIMARY KEY,
+            listing_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            status_after TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            history_complete INTEGER NOT NULL,
+            first_source_version TEXT NOT NULL,
+            event_hash TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_collector_presence_listing_time
+            ON collector_presence_events(listing_id, observed_at, source_event_id);
+
+        CREATE TABLE IF NOT EXISTS collector_candidate_ingests (
+            source_version TEXT PRIMARY KEY,
+            listings_total INTEGER NOT NULL,
+            price_events_total INTEGER NOT NULL,
+            presence_events_total INTEGER NOT NULL,
+            ingested_at TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS entity_operations (
             operation_id TEXT PRIMARY KEY,
@@ -434,7 +469,109 @@ def _observe_price(conn, row, previous, source_version, now):
         )
 
 
-def observe_listings(conn, rows, source_version, content_hash_fn=None):
+def _source_event_hash(event, fields):
+    payload = [event.get(field) for field in fields]
+    return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
+
+
+def _verify_source_event_hashes(conn, table, prepared):
+    expected = {row[0]: row[-1] for row in prepared}
+    source_ids = list(expected)
+    actual = {}
+    for start in range(0, len(source_ids), 500):
+        chunk = source_ids[start:start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        actual.update({row[0]: row[1] for row in conn.execute(
+            f"SELECT source_event_id,event_hash FROM {table} "
+            f"WHERE source_event_id IN ({placeholders})", chunk,
+        )})
+    missing = set(expected) - set(actual)
+    conflicts = [event_id for event_id, digest in actual.items()
+                 if expected[event_id] != digest]
+    if missing or conflicts:
+        raise ValueError(
+            f"source event conflict in {table}: missing={len(missing)}, "
+            f"conflicts={conflicts[:5]}"
+        )
+
+
+def ingest_candidate_history(conn, source_version, rows,
+                             price_observations, presence_events):
+    """Persist immutable Collector events before advancing the source version.
+
+    ``source_event_id`` is the idempotency key.  Replaying the same candidate
+    version has no effect, while reusing an ID with different content aborts
+    the transaction instead of silently rewriting history.
+    """
+    listing_ids = {str(row["id"]) for row in rows}
+    price_fields = (
+        "source_event_id", "listing_id", "observed_at", "price",
+        "event_type", "history_complete",
+    )
+    presence_fields = (
+        "source_event_id", "listing_id", "event_type", "status_after",
+        "observed_at", "history_complete",
+    )
+
+    prepared_prices = []
+    for event in price_observations:
+        if str(event.get("listing_id")) not in listing_ids:
+            raise ValueError("price event references a listing outside the snapshot")
+        normalized = tuple(event.get(field) for field in price_fields)
+        prepared_prices.append(
+            normalized + (str(source_version), _source_event_hash(event, price_fields))
+        )
+
+    prepared_presence = []
+    for event in presence_events:
+        if str(event.get("listing_id")) not in listing_ids:
+            raise ValueError("presence event references a listing outside the snapshot")
+        normalized = tuple(event.get(field) for field in presence_fields)
+        prepared_presence.append(
+            normalized + (str(source_version), _source_event_hash(event, presence_fields))
+        )
+
+    before = conn.total_changes
+    conn.executemany(
+        "INSERT OR IGNORE INTO collector_price_events "
+        "(source_event_id,listing_id,observed_at,price,event_type,history_complete,"
+        "first_source_version,event_hash) VALUES (?,?,?,?,?,?,?,?)",
+        prepared_prices,
+    )
+    conn.executemany(
+        "INSERT OR IGNORE INTO collector_presence_events "
+        "(source_event_id,listing_id,event_type,status_after,observed_at,history_complete,"
+        "first_source_version,event_hash) VALUES (?,?,?,?,?,?,?,?)",
+        prepared_presence,
+    )
+    _verify_source_event_hashes(conn, "collector_price_events", prepared_prices)
+    _verify_source_event_hashes(conn, "collector_presence_events", prepared_presence)
+
+    existing = conn.execute(
+        "SELECT listings_total,price_events_total,presence_events_total "
+        "FROM collector_candidate_ingests WHERE source_version=?",
+        (str(source_version),),
+    ).fetchone()
+    totals = (len(rows), len(price_observations), len(presence_events))
+    if existing and tuple(existing) != totals:
+        raise ValueError(
+            f"candidate version {source_version} was already ingested with different totals"
+        )
+    conn.execute(
+        "INSERT OR IGNORE INTO collector_candidate_ingests "
+        "(source_version,listings_total,price_events_total,presence_events_total,ingested_at) "
+        "VALUES (?,?,?,?,?)",
+        (str(source_version), *totals, _now()),
+    )
+    return {
+        "price_events": len(prepared_prices),
+        "presence_events": len(prepared_presence),
+        "new_rows": conn.total_changes - before,
+    }
+
+
+def observe_listings(conn, rows, source_version, content_hash_fn=None,
+                     source_history=False):
     """Persist listing episodes and locally observable presence transitions.
 
     Existing Collector history cannot be reconstructed: the first event for
@@ -473,7 +610,7 @@ def observe_listings(conn, rows, source_version, content_hash_fn=None):
             event_type = None
             history_complete = None
 
-        if event_type:
+        if event_type and not source_history:
             conn.execute(
                 "INSERT OR IGNORE INTO listing_presence_events "
                 "(listing_id,event_type,status_after,observed_at,history_complete,source_version) "
@@ -482,7 +619,8 @@ def observe_listings(conn, rows, source_version, content_hash_fn=None):
                  _presence_time(row, event_type, now), history_complete, str(source_version)),
             )
 
-        _observe_price(conn, row, previous, source_version, now)
+        if not source_history:
+            _observe_price(conn, row, previous, source_version, now)
 
         identity_snapshot = {
             field: row.get(field) for field in IDENTITY_SNAPSHOT_FIELDS
@@ -575,15 +713,35 @@ def recompute_entity(conn, entity_id, now=None):
 def _market_period_count(conn, entity_id, states):
     """Count disjoint known on-market periods across all entity members."""
     events = defaultdict(list)
-    for event in conn.execute(
+    source_events = list(conn.execute(
         """SELECT p.listing_id,p.event_type,p.observed_at
-             FROM listing_presence_events p
+             FROM collector_presence_events p
              JOIN entity_members m ON m.listing_id=p.listing_id
-            WHERE m.entity_id=? AND p.event_type!='bootstrap_state'
-            ORDER BY p.observed_at,p.local_event_id""",
+            WHERE m.entity_id=?
+            ORDER BY p.observed_at,p.source_event_id""",
         (entity_id,),
-    ):
-        events[event["listing_id"]].append(event)
+    ))
+    if source_events:
+        for event in source_events:
+            event_type = event["event_type"]
+            if event_type in {"bootstrap_state", "first_seen"}:
+                continue
+            events[event["listing_id"]].append({
+                "event_type": (
+                    "missing" if event_type == "missing_confirmed" else event_type
+                ),
+                "observed_at": event["observed_at"],
+            })
+    else:
+        for event in conn.execute(
+            """SELECT p.listing_id,p.event_type,p.observed_at
+                 FROM listing_presence_events p
+                 JOIN entity_members m ON m.listing_id=p.listing_id
+                WHERE m.entity_id=? AND p.event_type!='bootstrap_state'
+                ORDER BY p.observed_at,p.local_event_id""",
+            (entity_id,),
+        ):
+            events[event["listing_id"]].append(event)
 
     intervals = []
     for state in states:
@@ -817,10 +975,19 @@ def merge_listings(conn, listing_a, listing_b, reason,
     if len(entities) == 1:
         return next(iter(entities)), False
     details = list(conn.execute(
-        "SELECT entity_id,created_at FROM property_entities WHERE entity_id IN (?,?)",
+        """SELECT e.entity_id,e.created_at,COUNT(m.listing_id) AS member_count
+             FROM property_entities e
+             LEFT JOIN entity_members m ON m.entity_id=e.entity_id
+            WHERE e.entity_id IN (?,?)
+            GROUP BY e.entity_id,e.created_at""",
         tuple(entities),
     ))
-    details.sort(key=lambda r: (r["created_at"], r["entity_id"]))
+    # Preserve the identity with more accumulated history. This also makes a
+    # later singleton merge deterministic when entities were created in the
+    # same second and their UUID ordering is otherwise arbitrary.
+    details.sort(key=lambda r: (
+        -int(r["member_count"] or 0), r["created_at"], r["entity_id"],
+    ))
     survivor, absorbed = details[0]["entity_id"], details[1]["entity_id"]
     key = f"merge:{survivor}:{absorbed}:{decision_revision}"
     operation_id, created = _operation(
@@ -1021,17 +1188,33 @@ def entity_detail(conn, entity_id):
             (listing_id,),
         ).fetchone()
         presence = [dict(row) for row in conn.execute(
-            "SELECT event_type,status_after,observed_at,history_complete,source_version "
-            "FROM listing_presence_events WHERE listing_id=? "
-            "ORDER BY observed_at,local_event_id",
+            "SELECT source_event_id,event_type,status_after,observed_at,history_complete,"
+            "first_source_version AS source_version "
+            "FROM collector_presence_events WHERE listing_id=? "
+            "ORDER BY observed_at,source_event_id",
             (listing_id,),
         )]
+        if not presence:
+            presence = [dict(row) for row in conn.execute(
+                "SELECT NULL AS source_event_id,event_type,status_after,observed_at,"
+                "history_complete,source_version FROM listing_presence_events "
+                "WHERE listing_id=? ORDER BY observed_at,local_event_id",
+                (listing_id,),
+            )]
         prices = [dict(row) for row in conn.execute(
-            "SELECT observed_at,price,observation_type,history_complete,source_version "
-            "FROM listing_price_observations WHERE listing_id=? "
-            "ORDER BY observed_at,observation_id",
+            "SELECT source_event_id,observed_at,price,event_type AS observation_type,"
+            "history_complete,first_source_version AS source_version "
+            "FROM collector_price_events WHERE listing_id=? "
+            "ORDER BY observed_at,source_event_id",
             (listing_id,),
         )]
+        if not prices:
+            prices = [dict(row) for row in conn.execute(
+                "SELECT NULL AS source_event_id,observed_at,price,observation_type,"
+                "history_complete,source_version FROM listing_price_observations "
+                "WHERE listing_id=? ORDER BY observed_at,observation_id",
+                (listing_id,),
+            )]
         members.append({
             "state": dict(state),
             "listing": json.loads(snapshot[0]) if snapshot else None,
@@ -1052,28 +1235,108 @@ def entity_detail(conn, entity_id):
     }
 
 
-def match_candidates_page(conn, status=None, limit=50, offset=0):
+def match_candidates_page(
+    conn, status=None, limit=50, offset=0, *, min_priority=None,
+    min_reason_count=None, reason_count=None, activity=None, eligibility=None,
+    photo_decision=None, min_score=None, max_score=None,
+    order_by="priority",
+):
     """Return current shadow candidates with compact source listing snapshots."""
-    where = "WHERE c.is_current=1"
+    clauses = ["c.is_current=1"]
     params = []
     if status:
-        where += " AND c.status=?"
+        clauses.append("c.status=?")
         params.append(str(status))
+    if min_priority is not None:
+        clauses.append("c.priority>=?")
+        params.append(int(min_priority))
+    if min_reason_count is not None:
+        clauses.append("json_array_length(c.reasons_json)>=?")
+        params.append(int(min_reason_count))
+    if reason_count is not None:
+        clauses.append("json_array_length(c.reasons_json)=?")
+        params.append(int(reason_count))
+
+    low_active = "COALESCE(json_extract(low.payload_json,'$.status'),'')='active'"
+    high_active = "COALESCE(json_extract(high.payload_json,'$.status'),'')='active'"
+    if activity == "both_active":
+        clauses.extend((low_active, high_active))
+    elif activity == "active_missing":
+        clauses.append(f"(({low_active}) != ({high_active}))")
+    elif activity == "both_missing":
+        clauses.extend((f"NOT ({low_active})", f"NOT ({high_active})"))
+    elif activity is not None:
+        raise ValueError("unsupported activity filter")
+
+    low_eligible = (
+        "COALESCE(CAST(json_extract(low.payload_json,'$.baseline_eligible') "
+        "AS INTEGER),0)=1"
+    )
+    high_eligible = (
+        "COALESCE(CAST(json_extract(high.payload_json,'$.baseline_eligible') "
+        "AS INTEGER),0)=1"
+    )
+    if eligibility == "both":
+        clauses.extend((low_eligible, high_eligible))
+    elif eligibility == "at_least_one":
+        clauses.append(f"(({low_eligible}) OR ({high_eligible}))")
+    elif eligibility == "neither":
+        clauses.extend((f"NOT ({low_eligible})", f"NOT ({high_eligible})"))
+    elif eligibility is not None:
+        raise ValueError("unsupported eligibility filter")
+    if photo_decision is not None:
+        clauses.append("edge.decision=?")
+        params.append(str(photo_decision))
+    if min_score is not None:
+        clauses.append("edge.score>=?")
+        params.append(float(min_score))
+    if max_score is not None:
+        clauses.append("edge.score<=?")
+        params.append(float(max_score))
+
+    where = "WHERE " + " AND ".join(clauses)
+    joins = (
+        "LEFT JOIN listing_identity_snapshots low "
+        "ON low.listing_id=c.listing_id_low "
+        "LEFT JOIN listing_identity_snapshots high "
+        "ON high.listing_id=c.listing_id_high "
+        "LEFT JOIN entity_match_edges edge "
+        "ON edge.listing_id_low=c.listing_id_low "
+        "AND edge.listing_id_high=c.listing_id_high AND edge.is_current=1"
+    )
     total = conn.execute(
-        f"SELECT COUNT(*) FROM entity_match_candidates c {where}", params,
+        f"SELECT COUNT(*) FROM entity_match_candidates c {joins} {where}", params,
     ).fetchone()[0]
+    if order_by == "priority":
+        order_sql = (
+            "c.priority DESC,c.updated_at,c.listing_id_low,c.listing_id_high"
+        )
+    elif order_by == "revision_hash":
+        # candidate_revision_hash is SHA-256, so lexical ordering gives a
+        # deterministic pseudo-random sample without SQLite random().
+        order_sql = (
+            "c.candidate_revision_hash,c.listing_id_low,c.listing_id_high"
+        )
+    else:
+        raise ValueError("unsupported candidate order")
     rows = []
     for candidate in conn.execute(
         f"""SELECT c.*,
                     low.payload_json AS low_payload_json,
-                    high.payload_json AS high_payload_json
+                    high.payload_json AS high_payload_json,
+                    edge.match_revision_hash AS photo_match_revision_hash,
+                    edge.score AS photo_score,
+                    edge.decision AS photo_decision,
+                    edge.normalization_version AS photo_normalization_version,
+                    edge.fingerprint_version AS photo_fingerprint_version,
+                    edge.intra_listing_dedupe_version AS photo_dedupe_version,
+                    edge.photo_role_model_version AS photo_role_model_version,
+                    edge.matcher_version AS photo_matcher_version,
+                    edge.processed_at AS photo_processed_at
              FROM entity_match_candidates c
-             LEFT JOIN listing_identity_snapshots low
-               ON low.listing_id=c.listing_id_low
-             LEFT JOIN listing_identity_snapshots high
-               ON high.listing_id=c.listing_id_high
+             {joins}
              {where}
-             ORDER BY c.priority DESC,c.updated_at,c.listing_id_low,c.listing_id_high
+             ORDER BY {order_sql}
              LIMIT ? OFFSET ?""",
         params + [int(limit), int(offset)],
     ):
@@ -1090,6 +1353,47 @@ def match_candidates_page(conn, status=None, limit=50, offset=0):
             json.loads(item.pop("high_payload_json"))
             if item["high_payload_json"] else None
         )
+        low_payload = item["listing_low"] or {}
+        high_payload = item["listing_high"] or {}
+        active_count = sum(
+            payload.get("status") == "active"
+            for payload in (low_payload, high_payload)
+        )
+        eligible_count = sum(
+            bool(payload.get("baseline_eligible"))
+            for payload in (low_payload, high_payload)
+        )
+        item["queue_facts"] = {
+            "reason_count": len(item["reasons"]),
+            "activity": (
+                "both_active" if active_count == 2
+                else "active_missing" if active_count == 1
+                else "both_missing"
+            ),
+            "baseline_eligible_count": eligible_count,
+        }
+        photo_match_revision = item.pop("photo_match_revision_hash")
+        if photo_match_revision is not None:
+            item["photo_evidence"] = {
+                "match_revision_hash": photo_match_revision,
+                "score": item.pop("photo_score"),
+                "decision": item.pop("photo_decision"),
+                "normalization_version": item.pop("photo_normalization_version"),
+                "fingerprint_version": item.pop("photo_fingerprint_version"),
+                "intra_listing_dedupe_version": item.pop("photo_dedupe_version"),
+                "photo_role_model_version": item.pop("photo_role_model_version"),
+                "matcher_version": item.pop("photo_matcher_version"),
+                "processed_at": item.pop("photo_processed_at"),
+            }
+        else:
+            for field in (
+                "photo_score", "photo_decision", "photo_normalization_version",
+                "photo_fingerprint_version", "photo_dedupe_version",
+                "photo_role_model_version", "photo_matcher_version",
+                "photo_processed_at",
+            ):
+                item.pop(field)
+            item["photo_evidence"] = None
         rows.append(item)
     return total, rows
 
@@ -1102,7 +1406,7 @@ def _canonical_pair(listing_a, listing_b):
 
 
 def record_photo_evidence(conn, listing_a, listing_b, evidence):
-    """Store a fully versioned pair result produced by purchase Main.
+    """Store a fully versioned pair result produced by the photo worker.
 
     This is deliberately evidence-only. A high score never mutates entity
     membership while auto-merge is disabled.

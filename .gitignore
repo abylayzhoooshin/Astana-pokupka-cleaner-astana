@@ -9,6 +9,7 @@ run.ps1
 
 # Данные рантайма: база вердиктов и всё, что вокруг неё.
 data/
+pilot_data/
 *.db
 *.db-wal
 *.db-shm
@@ -19,6 +20,7 @@ data/
 review*.json
 meta.json
 *.log
+photo_worker_cache/
 
 # Python
 __pycache__/

@@ -37,13 +37,14 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import entity_store
+import sale_listing_profile
 
 log = logging.getLogger("cleaner_db")
 
 DB_PATH = os.environ.get("CLEANER_DB") or os.path.join(
     os.environ.get("DATA_DIR", "."), "sales_cleaner_astana.db"
 )
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 
 
 def utcnow_iso():
@@ -140,6 +141,39 @@ def _create_schema(conn):
         )
         """
     )
+    # Отдельно от verdicts: это наблюдаемые утверждения автора, а не
+    # решение о пригодности цены. Старые verdicts при миграции не меняются.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS listing_text_profiles (
+            id TEXT PRIMARY KEY,
+            profile_hash TEXT NOT NULL,
+            profile_version TEXT NOT NULL,
+            profile_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS main_text_assessments (
+            listing_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            evaluator_version TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (listing_id, content_hash, evaluator_version)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS main_photo_assessments (
+            listing_id TEXT NOT NULL,
+            photo_hash_key TEXT NOT NULL,
+            evaluator_version TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (listing_id, photo_hash_key, evaluator_version)
+        )"""
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_verdicts_usable ON verdicts(usable)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_verdicts_code ON verdicts(reason_code)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_batches_status ON batches(status)")
@@ -212,6 +246,40 @@ def connect():
 
 
 # ============================== verdicts ==============================
+
+def update_text_profiles(conn, rows):
+    """Обновить только изменившиеся тексты/структурированные признаки.
+
+    Не вызывает ИИ, не скачивает фото и не трогает опубликованный baseline.
+    Цена, status и timestamps не входят в отдельный hash профиля.
+    """
+    known = {
+        row["id"]: (row["profile_hash"], row["profile_version"])
+        for row in conn.execute(
+            "SELECT id,profile_hash,profile_version FROM listing_text_profiles")
+    }
+    changed = 0
+    for row in rows:
+        listing_id = str(row["id"])
+        fingerprint = sale_listing_profile.profile_hash(row)
+        if known.get(listing_id) == (fingerprint, sale_listing_profile.PROFILE_VERSION):
+            continue
+        profile = sale_listing_profile.classify(row)
+        conn.execute(
+            """INSERT INTO listing_text_profiles
+               (id,profile_hash,profile_version,profile_json,updated_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+               profile_hash=excluded.profile_hash,
+               profile_version=excluded.profile_version,
+               profile_json=excluded.profile_json,
+               updated_at=excluded.updated_at""",
+            (listing_id, fingerprint, sale_listing_profile.PROFILE_VERSION,
+             json.dumps(profile, ensure_ascii=False), utcnow_iso()),
+        )
+        changed += 1
+    return changed
+
 
 def get_known_hashes(conn, ids):
     """{id: content_hash} для уже обработанных id из списка. Используется

@@ -18,9 +18,11 @@ baseline_api.py в коллекторе (токен, пагинация, health 
     предпочитают свести данные сами.
 """
 import json
+import logging
 import os
 import secrets
 import time
+from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
@@ -28,6 +30,7 @@ from pydantic import BaseModel
 
 import cleaner_db
 import entity_store
+import main_assessments
 import openai_batch
 
 API_KEY = os.environ.get("CLEANER_API_KEY", "").strip()
@@ -48,6 +51,7 @@ LAST_FULL_SUCCESS_KEY = "last_full_success"
 LAST_INGEST_TICK_KEY = "last_ingest_tick"
 
 app = FastAPI(title="rieltor-sales-cleaner-astana")
+log = logging.getLogger("sales_cleaner.main_assessments")
 
 _started_at = time.monotonic()
 
@@ -65,6 +69,12 @@ class ManualMatchDecisionRequest(BaseModel):
     reason: str
     actor: str = "manual-review"
     decision_revision: str
+
+
+class MainAssessmentRequest(BaseModel):
+    listing_id: str
+    text: Optional[dict] = None
+    photo: Optional[dict] = None
 
 
 def _record_result(key, result):
@@ -110,6 +120,21 @@ def require_write_api_key(x_api_key: str = Header(default="")):
         )
     if not secrets.compare_digest(x_api_key, API_KEY):
         raise HTTPException(status_code=401, detail="неверный или отсутствующий X-API-Key")
+
+
+@app.post("/main/assessments", dependencies=[Depends(require_write_api_key)])
+def main_assessment(payload: MainAssessmentRequest):
+    try:
+        with cleaner_db.connect() as conn:
+            result = main_assessments.save(conn, payload.dict())
+            conn.commit()
+        log.info(
+            "saved listing_id=%s text=%s photo=%s",
+            result["listing_id"], result["text_saved"], result["photo_saved"],
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 # ========================= чистый baseline =========================
@@ -173,6 +198,34 @@ def baseline_clean_csv():
 
 
 # ============================= вердикты =============================
+
+@app.get("/text-profiles/table", dependencies=[Depends(require_api_key)])
+def text_profiles(limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+                  offset: int = Query(0, ge=0)):
+    """Заявленные в объявлении признаки, отдельно от решения usable."""
+    with cleaner_db.connect() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM listing_text_profiles").fetchone()[0]
+        rows = [dict(row) for row in conn.execute(
+            "SELECT id,profile_hash,profile_version,profile_json,updated_at "
+            "FROM listing_text_profiles ORDER BY id LIMIT ? OFFSET ?", (limit, offset)
+        )]
+    for row in rows:
+        row["profile"] = json.loads(row.pop("profile_json"))
+    return {"total": total, "limit": limit, "offset": offset, "rows": rows}
+
+
+@app.get("/text-profiles/{listing_id}", dependencies=[Depends(require_api_key)])
+def text_profile(listing_id: str):
+    with cleaner_db.connect() as conn:
+        row = conn.execute(
+            "SELECT id,profile_hash,profile_version,profile_json,updated_at "
+            "FROM listing_text_profiles WHERE id=?", (listing_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="text profile not collected")
+    result = dict(row)
+    result["profile"] = json.loads(result.pop("profile_json"))
+    return result
 
 # Колонки вердикта без снимков текста: снимки нужны только для ручной
 # проверки через /verdicts/review, а в постраничной выгрузке они раздували
@@ -272,6 +325,12 @@ def meta():
 @app.get("/entities/stats", dependencies=[Depends(require_api_key)])
 def entity_stats():
     with cleaner_db.connect() as conn:
+        source_presence = conn.execute(
+            "SELECT COUNT(*) FROM collector_presence_events"
+        ).fetchone()[0]
+        source_prices = conn.execute(
+            "SELECT COUNT(*) FROM collector_price_events"
+        ).fetchone()[0]
         entity_counts = {
             row["lifecycle_status"]: row["amount"]
             for row in conn.execute(
@@ -296,10 +355,11 @@ def entity_stats():
             ).fetchone()[0],
             "presence_events": conn.execute(
                 "SELECT COUNT(*) FROM listing_presence_events"
-            ).fetchone()[0],
+            ).fetchone()[0] if not source_presence else source_presence,
             "price_observations": conn.execute(
                 "SELECT COUNT(*) FROM listing_price_observations"
-            ).fetchone()[0],
+            ).fetchone()[0] if not source_prices else source_prices,
+            "source_history": bool(source_presence or source_prices),
             "current_match_candidates": conn.execute(
                 "SELECT COUNT(*) FROM entity_match_candidates WHERE is_current=1"
             ).fetchone()[0],
@@ -322,10 +382,37 @@ def entity_match_review(
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
     status: str = Query(None),
+    min_priority: Optional[int] = Query(None, ge=0),
+    min_reason_count: Optional[int] = Query(None, ge=1, le=4),
+    reason_count: Optional[int] = Query(None, ge=1, le=4),
+    activity: Optional[
+        Literal["both_active", "active_missing", "both_missing"]
+    ] = Query(None),
+    eligibility: Optional[
+        Literal["both", "at_least_one", "neither"]
+    ] = Query(None),
+    photo_decision: Optional[
+        Literal["likely_same", "likely_different", "uncertain"]
+    ] = Query(None),
+    min_score: Optional[float] = Query(None, ge=0, le=1),
+    max_score: Optional[float] = Query(None, ge=0, le=1),
+    order_by: Literal["priority", "revision_hash"] = Query("priority"),
 ):
+    if min_score is not None and max_score is not None and min_score > max_score:
+        raise HTTPException(status_code=422, detail="min_score must not exceed max_score")
+    if min_reason_count is not None and reason_count is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="min_reason_count and reason_count are mutually exclusive",
+        )
     with cleaner_db.connect() as conn:
         total, rows = entity_store.match_candidates_page(
             conn, status=status, limit=limit, offset=offset,
+            min_priority=min_priority, min_reason_count=min_reason_count,
+            reason_count=reason_count,
+            activity=activity, eligibility=eligibility,
+            photo_decision=photo_decision, min_score=min_score,
+            max_score=max_score, order_by=order_by,
         )
     return {
         "total": total,
@@ -333,6 +420,18 @@ def entity_match_review(
         "offset": offset,
         "returned": len(rows),
         "auto_merge_enabled": False,
+        "filters": {
+            "status": status,
+            "min_priority": min_priority,
+            "min_reason_count": min_reason_count,
+            "reason_count": reason_count,
+            "activity": activity,
+            "eligibility": eligibility,
+            "photo_decision": photo_decision,
+            "min_score": min_score,
+            "max_score": max_score,
+            "order_by": order_by,
+        },
         "rows": rows,
     }
 

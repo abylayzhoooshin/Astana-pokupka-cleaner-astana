@@ -35,6 +35,8 @@ import os
 import requests
 
 import cleaner_db
+import main_assessments
+import main_photo_sync
 import collector_client
 import entity_matcher
 import entity_store
@@ -288,6 +290,24 @@ def apply_heuristics(conn, to_process, baseline_version):
     return remainder
 
 
+def apply_main_comparison(conn, to_process, baseline_version):
+    """Use exact, versioned Main decisions before paying for a Cleaner batch."""
+    remainder = []
+    reused = 0
+    for row, content_hash in to_process:
+        verdict = main_assessments.comparison_for_row(conn, row)
+        if verdict is None:
+            remainder.append((row, content_hash))
+            continue
+        cleaner_db.upsert_verdict(
+            conn, row["id"], content_hash, verdict, baseline_version, row=row,
+            policy_version=main_assessments.COMPARISON_POLICY_VERSION,
+        )
+        reused += 1
+    conn.commit()
+    return remainder, reused
+
+
 def apply_rules_to_known(conn, rows):
     """Применяет бесплатные правила ко ВСЕМ строкам, а не только к новым.
 
@@ -458,13 +478,17 @@ def publish_clean_baseline(conn, rows, version):
         совпадает). Новые и изменённые объявления ждут разметки — иначе
         мусор жил бы в «чистой» выдаче до следующего цикла, а у изменённого
         объявления висел бы вердикт по старому тексту;
-      - вердикт не usable=0. usable=None (модель так и не смогла разобрать
-        после MAX_LLM_ATTEMPTS) остаётся: сбой модели — «не знаю», а не «плохое».
+      - вердикт usable=True. usable=None означает «не знаю» и не может
+        подтверждать цену для базы аналогов.
 
     Пересборка целиком, а не точечное добавление: так из снимка сами уходят
     объявления, пропавшие с сайта, у опубликованных обновляется цена, а
     недоделанное обновление не может оставить снимок в промежуточном виде.
     """
+    # Guard the publication boundary as well as run_cycle. A direct/manual
+    # rebuild must never put owner or unknown-seller prices into comparisons.
+    rows = _comparison_rows(rows)
+
     # Функция может вызываться не только из полного цикла (ingest tick,
     # recovery, тестовый/manual rebuild), поэтому не полагается на то, что
     # entity observation уже выполнили выше по стеку.
@@ -473,20 +497,43 @@ def publish_clean_baseline(conn, rows, version):
     )
 
     state = cleaner_db.verdict_state_map(conn)
+    source_state = cleaner_db.verdict_source_map(conn)
     clean, rejected, waiting = [], 0, 0
     for row in rows:
         st = state.get(row["id"])
         if st is None or st[1] != collector_client.content_hash(row):
             waiting += 1
+        elif main_assessments.has_current_text_version(conn, row):
+            current = main_assessments.comparison_for_row(conn, row)
+            if current is None:
+                # The Main text verdict was made for an old price or photo set.
+                # Leave the old baseline intact until an exact result arrives.
+                waiting += 1
+            else:
+                if (st[0] != int(current["usable"])
+                        or source_state[row["id"]][2] != current["reason_code"]):
+                    cleaner_db.upsert_verdict(
+                        conn, row["id"], collector_client.content_hash(row),
+                        current, version, row=row,
+                        policy_version=main_assessments.COMPARISON_POLICY_VERSION,
+                    )
+                if current["usable"]:
+                    clean.append(row)
+                else:
+                    rejected += 1
         elif st[0] == 0:
             rejected += 1
+        elif st[0] is None:
+            waiting += 1
         else:
             clean.append(row)
+
 
     # Только publication-ready members участвуют в canonical selection.
     # Поэтому новый active listing без текущего text verdict не может
     # вытеснить старый проверенный member той же physical entity.
     clean, entity_stats = entity_store.canonicalize_ready_rows(conn, clean, version)
+    clean = main_assessments.enrich_rows(conn, clean)
 
     # ПУСТОЙ СНИМОК НЕ ПУБЛИКУЕМ. На холодном старте первый цикл только
     # отправляет объявления в batch, вердиктов по текущему тексту ещё нет
@@ -520,6 +567,21 @@ def publish_clean_baseline(conn, rows, version):
 _last_full_fetch = {"version": None, "rows": None}
 
 
+def _comparison_rows(rows):
+    """Only verified professional sale listings may anchor asking-price comparisons.
+
+    The Collector candidate snapshot deliberately retains owners and unknown
+    sellers for lifecycle/entity history.  Its ``baseline_eligible`` flag is
+    technical validation, not a seller policy.  Unknown seller type must not
+    silently contaminate the professional-only price baseline.
+    """
+    return [
+        row for row in rows
+        if row.get("baseline_eligible") in (1, True, "1")
+        and str(row.get("seller_type") or "").strip().lower() == "professional"
+    ]
+
+
 def run_ingest_tick():
     """Лёгкая проверка готовых batch-заданий МЕЖДУ полными циклами (см.
     CLEANER_INGEST_TICK_S в service.py). Не ходит к коллектору и не
@@ -540,10 +602,16 @@ def run_ingest_tick():
         return None  # ещё не было ни одного полного цикла — ждём его
 
     with cleaner_db.connect() as conn:
-        if not cleaner_db.pending_batches(conn):
+        try:
+            photo_sync = main_photo_sync.sync(conn)
+        except (main_photo_sync.PhotoSyncError, ValueError) as exc:
+            log.warning("тик: фотооценки Main пока не синхронизированы: %s", exc)
+            photo_sync = {"error": type(exc).__name__}
+        photo_changed = bool(photo_sync.get("received"))
+        if not cleaner_db.pending_batches(conn) and not photo_changed:
             return None
         ingested = ingest_completed_batches(conn, fresh_rows=rows)
-        if not ingested:
+        if not ingested and not photo_changed:
             return None
         overridden, reopened = apply_rules_to_known(conn, rows)
 
@@ -555,12 +623,14 @@ def run_ingest_tick():
         left = cleaner_db.relabel_remaining(conn)
         if left:
             log.info("тик: перепрогон не закончен (осталось %s) — снимок не трогаем", left)
-            return {"tick": True, "ingested": ingested, "rules_overridden": overridden,
+            return {"tick": True, "ingested": ingested, "main_photo_sync": photo_sync,
+                    "rules_overridden": overridden,
                     "rules_reopened": reopened, "publish_skipped": "relabel_in_progress",
                     "waiting": left}
 
         published = publish_clean_baseline(conn, rows, _last_full_fetch["version"])
-        return {"tick": True, "ingested": ingested, "rules_overridden": overridden,
+        return {"tick": True, "ingested": ingested, "main_photo_sync": photo_sync,
+                "rules_overridden": overridden,
                 "rules_reopened": reopened, **published}
 
 
@@ -569,10 +639,18 @@ def run_cycle():
     слоям, отправить остаток, опубликовать чистый baseline.
     Вызывается раз в CLEANER_CYCLE_INTERVAL_H часов из service.py."""
     with cleaner_db.connect() as conn:
+        try:
+            photo_sync = main_photo_sync.sync(conn)
+        except (main_photo_sync.PhotoSyncError, ValueError) as exc:
+            log.warning("фотооценки Main пока не синхронизированы: %s", exc)
+            photo_sync = {"error": type(exc).__name__}
         # Снимок коллектора берём ДО разбора batch: он нужен и для
         # диффа, и для снимков текста отбракованных объявлений.
         try:
-            version, rows = collector_client.fetch_all_rows()
+            snapshot = collector_client.fetch_candidate_snapshot()
+            version = snapshot.version
+            all_rows = snapshot.rows
+            rows = _comparison_rows(all_rows)
         except (collector_client.CollectorError, requests.RequestException):
             log.exception("не удалось получить baseline у коллектора — цикл прерван")
             # Собрать готовые batch всё равно пытаемся: результаты уже
@@ -587,11 +665,17 @@ def run_cycle():
         _last_full_fetch["version"] = version
         _last_full_fetch["rows"] = rows
 
+        source_history = entity_store.ingest_candidate_history(
+            conn, version, all_rows,
+            snapshot.price_observations, snapshot.presence_events,
+        )
+
         entity_observation = entity_store.observe_listings(
-            conn, rows, version, content_hash_fn=collector_client.content_hash,
+            conn, all_rows, version, content_hash_fn=collector_client.content_hash,
+            source_history=True,
         )
         entity_candidates = (
-            entity_matcher.refresh_shadow_candidates(conn, rows, version)
+            entity_matcher.refresh_shadow_candidates(conn, all_rows, version)
             if ENTITY_SHADOW_ENABLED else {
                 "current_candidates": 0,
                 "awaiting_photo_analysis": 0,
@@ -599,6 +683,10 @@ def run_cycle():
                 "disabled": True,
             }
         )
+        # Профиль строится для всех source IDs (включая missing и строки,
+        # исключённые из legacy baseline). Это отдельный, бесплатный
+        # shadow-слой; вердикты и публикацию он не меняет.
+        profile_updates = cleaner_db.update_text_profiles(conn, all_rows)
         conn.commit()
 
         ingested = ingest_completed_batches(conn, fresh_rows=rows)
@@ -636,6 +724,7 @@ def run_cycle():
         )
 
         remainder = apply_heuristics(conn, to_process, version)
+        remainder, main_reused = apply_main_comparison(conn, remainder, version)
         submitted, sent_count = submit_new_batches(conn, remainder)
 
         # Последним шагом: к этому моменту в базе уже и результаты batch,
@@ -652,16 +741,21 @@ def run_cycle():
 
         return {
             **published,
+            "main_photo_sync": photo_sync,
             "rules_overridden": overridden,
             "rules_reopened": reopened,
             "ingested": ingested,
             "collector_version": version,
+            "source_history": source_history,
             "entity_observation": entity_observation,
             "entity_candidates": entity_candidates,
-            "total": len(rows),
+            "text_profiles_updated": profile_updates,
+            "total": len(all_rows),
+            "baseline_eligible": len(rows),
             "unchanged": unchanged,
             "to_process": len(to_process),
-            "resolved_free": len(to_process) - len(remainder),
+            "resolved_free": len(to_process) - len(remainder) - main_reused,
+            "resolved_main": main_reused,
             "submitted_batches": len(submitted),
             "submitted_listings": sent_count,
             # Сколько объявлений НЕ уехало в этом цикле и ждёт следующего.

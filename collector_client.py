@@ -1,28 +1,27 @@
 """
-collector_client.py — забирает baseline у сервиса-коллектора и решает,
-что из него РЕАЛЬНО новое для нас.
+collector_client.py — забирает одну immutable candidate-версию Collector:
+объявления, фото-метаданные, историю цен и presence events.
 
 ПОЧЕМУ ДИФФ ПО ХЭШУ КОНТЕНТА, А НЕ ПО ВЕРСИИ CELIKOM.
-Версия baseline у коллектора меняется почти при каждой пересборке (раз
-в 30 минут) — цена хоть одного объявления сдвинулась, и версия уже
+Версия snapshot у Collector меняется при изменении её содержимого: если хоть у
+одного объявления сдвинулась цена, версия уже
 другая. Если гонять ИИ на "всё, что в новой версии есть, а в старой не
 было по id" — это будет захватывать unchanged объявления просто потому,
 что они лежат в новом файле. Нам нужно куда более узкое множество: то,
-у чего реально изменилось то, что ВЛИЯЕТ НА ВЕРДИКТ (описание, фото,
+у чего реально изменилось то, что ВЛИЯЕТ НА ТЕКСТОВЫЙ ВЕРДИКТ (описание,
 признак отделки) — не цена, не last_seen_at.
 
 Поэтому здесь: тянем ВСЮ таблицу постранично (десятки тысяч строк всё ещё
 укладываются в обычный HTTP snapshot), для каждой строки считаем content_hash по релевантным полям,
 сравниваем со СВОИМ хранилищем (cleaner_db.get_known_hashes) — и в
-работу идут только несовпадения. Не оптимально по трафику (качаем всё
-каждый раз), но коллектор рассчитан именно на это (см. пагинацию в
-baseline_api.py), а объём (пара МБ раз в сутки) не то, ради чего стоит
-городить инкрементальный API на стороне коллектора.
+работу идут только несовпадения. Все таблицы выгружаются с одним зафиксированным
+`version`; подмена версии или оборванная пагинация отклоняют весь snapshot.
 """
 import hashlib
 import json
 import logging
 import os
+from dataclasses import dataclass
 
 import requests
 
@@ -32,35 +31,39 @@ COLLECTOR_URL = os.environ.get("COLLECTOR_URL", "").rstrip("/")
 COLLECTOR_API_KEY = os.environ.get("COLLECTOR_API_KEY", "")
 PAGE_SIZE = int(os.environ.get("COLLECTOR_PAGE_SIZE", "500"))  # = потолок коллектора
 
-# Поля, которые реально влияют на текстовый вердикт.
-#
-# photo_set_hash здесь СОЗНАТЕЛЬНО НЕТ, хотя поле доступно. В модель
-# уходит только текст (см. openai_batch._format_listing) — фотографии
-# не отправляются. Значит смена фото при неизменном описании даст при
-# переоценке ровно тот же вердикт: платим за повторный прогон, получаем
-# идентичный результат. Хуже того, krisha при перевыкладке часто
-# выдаёт тем же снимкам новые URL, поэтому поле генерировало бы ложные
-# срабатывания на пустом месте.
-#
-# Вернуть сюда photo_set_hash нужно будет ровно тогда, когда появится
-# vision-слой и фотографии начнут влиять на вердикт — не раньше.
-#
-# Цена и last_seen_at не входят по той же логике: цена меняется часто,
-# на "комната это или квартира" не влияет никак.
+# Это ключ для текстового вердикта Cleaner. Цена и фото не входят: при их
+# изменении дорогую общую разметку не прогоняем заново. Вердикт Main, который
+# видит цену и фотоотчёт, отдельно проверяет контекст конкретной ревизии.
 CONTENT_FIELDS = (
     "title", "full_description", "rent_renovation", "priv_dorm",
-    "square_m2", "rooms",
+    "square_m2", "rooms", "floor", "floor_total", "street", "house_num",
+    "complex_id", "complex_name", "furniture",
 )
+
+
+def _content_value(row, field):
+    return row.get(field)
 
 
 class CollectorError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class CandidateSnapshot:
+    """One immutable Collector candidate version and its source histories."""
+
+    version: str
+    meta: dict
+    rows: list
+    price_observations: list
+    presence_events: list
+
+
 def content_hash(row):
     # JSON устраняет коллизии от разделителя внутри пользовательского текста
     # и сохраняет границы полей. Типы структурных значений тоже значимы.
-    payload = [row.get(field) for field in CONTENT_FIELDS]
+    payload = [_content_value(row, field) for field in CONTENT_FIELDS]
     canonical = json.dumps(
         payload,
         ensure_ascii=False,
@@ -107,6 +110,124 @@ def _headers():
     if COLLECTOR_API_KEY:
         h["X-API-Key"] = COLLECTOR_API_KEY
     return h
+
+
+def _get_json(path, *, params=None, timeout=60):
+    if not COLLECTOR_URL:
+        raise CollectorError("COLLECTOR_URL is not configured")
+    response = requests.get(
+        f"{COLLECTOR_URL}{path}", params=params, headers=_headers(), timeout=timeout,
+    )
+    if response.status_code == 503:
+        try:
+            detail = response.json().get("detail")
+        except (AttributeError, ValueError):
+            detail = None
+        raise CollectorError(f"Collector candidate snapshot is not ready: {detail or '503'}")
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise CollectorError(f"Collector returned invalid JSON object for {path}")
+    return data
+
+
+def fetch_candidate_meta():
+    """Pin the immutable candidate version used by the entire download."""
+    meta = _get_json("/baseline/candidates/meta", timeout=20)
+    version = meta.get("version")
+    if not isinstance(version, str) or not version:
+        raise CollectorError("candidate meta has no valid version")
+    for field in (
+        "listings_total", "photos_total", "price_observations_total",
+        "presence_events_total",
+    ):
+        value = meta.get(field)
+        if not isinstance(value, int) or value < 0:
+            raise CollectorError(f"candidate meta has invalid {field}: {value!r}")
+    return meta
+
+
+def _fetch_candidate_table(path, version, expected_total):
+    rows = []
+    offset = 0
+    while offset < expected_total:
+        data = _get_json(
+            path,
+            params={"version": version, "limit": PAGE_SIZE, "offset": offset},
+        )
+        if data.get("version") != version:
+            raise CollectorError(
+                f"candidate endpoint {path} returned version {data.get('version')!r}, "
+                f"expected {version!r}"
+            )
+        if data.get("total") != expected_total:
+            raise CollectorError(
+                f"candidate endpoint {path} total changed: "
+                f"{data.get('total')!r} != {expected_total}"
+            )
+        page = data.get("rows")
+        if not isinstance(page, list) or not page:
+            raise CollectorError(
+                f"candidate endpoint {path} ended at {offset} of {expected_total}"
+            )
+        rows.extend(page)
+        offset += len(page)
+        if len(rows) > expected_total:
+            raise CollectorError(
+                f"candidate endpoint {path} returned more than {expected_total} rows"
+            )
+    return rows
+
+
+def _validate_source_events(events, listing_ids, label):
+    source_ids = set()
+    for event in events:
+        source_event_id = event.get("source_event_id")
+        listing_id = str(event.get("listing_id"))
+        if not isinstance(source_event_id, str) or not source_event_id:
+            raise CollectorError(f"{label} contains an event without source_event_id")
+        if source_event_id in source_ids:
+            raise CollectorError(f"{label} contains duplicate source_event_id={source_event_id}")
+        if listing_id not in listing_ids:
+            raise CollectorError(
+                f"{label} event {source_event_id} references absent listing {listing_id}"
+            )
+        source_ids.add(source_event_id)
+
+
+def fetch_candidate_snapshot():
+    """Download one version-consistent pre-dedupe snapshot.
+
+    Listing pages reconstruct ``photo_urls`` from the immutable
+    ``listing_photos`` table.  Comparing their aggregate ``photo_count`` with
+    ``photos_total`` validates that photo data belongs to the same version
+    without downloading 880k URL rows a second time.
+    """
+    meta = fetch_candidate_meta()
+    version = meta["version"]
+    rows = _fetch_candidate_table(
+        "/baseline/candidates/listings", version, meta["listings_total"]
+    )
+    _validate_snapshot_photos(rows)
+    photo_total = sum(int(row.get("photo_count") or 0) for row in rows)
+    if photo_total != meta["photos_total"]:
+        raise CollectorError(
+            f"candidate photo total mismatch: listings contain {photo_total}, "
+            f"meta declares {meta['photos_total']}"
+        )
+
+    prices = _fetch_candidate_table(
+        "/baseline/candidates/prices", version, meta["price_observations_total"]
+    )
+    presence = _fetch_candidate_table(
+        "/baseline/candidates/presence", version, meta["presence_events_total"]
+    )
+    listing_ids = {str(row["id"]) for row in rows}
+    if len(listing_ids) != len(rows):
+        raise CollectorError("candidate listings contain duplicate listing IDs")
+    _validate_source_events(prices, listing_ids, "price history")
+    _validate_source_events(presence, listing_ids, "presence history")
+    return CandidateSnapshot(version, meta, rows, prices, presence)
 
 
 def fetch_meta():
