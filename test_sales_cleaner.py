@@ -1498,6 +1498,51 @@ class CollectorPaginationTests(unittest.TestCase):
 
 
 class CandidateCollectorContractTests(unittest.TestCase):
+    def test_candidate_download_uses_one_pinned_scope_on_all_pages(self):
+        scope = "astana_sale_pilot_v1"
+        revision = "fixed-geometry"
+        meta = {
+            "version": "v1", "scope": scope, "scope_revision": revision,
+            "listings_total": 1, "photos_total": 0,
+            "price_observations_total": 0, "presence_events_total": 0,
+        }
+        listing = collector_stub("1")
+        requested = []
+
+        def fake_get(url, **kwargs):
+            requested.append(kwargs.get("params"))
+            if url.endswith("/meta"):
+                return _Response(meta)
+            return _Response({"version": "v1", "scope": scope,
+                              "scope_revision": revision, "total": 1,
+                              "rows": [listing]})
+
+        with mock.patch.object(collector_client, "COLLECTOR_URL", "https://collector"), \
+                mock.patch.object(collector_client, "COLLECTOR_CANDIDATE_SCOPE", scope), \
+                mock.patch.object(collector_client.requests, "get", side_effect=fake_get):
+            snapshot = collector_client.fetch_candidate_snapshot()
+        self.assertEqual("v1:astana_sale_pilot_v1:fixed-geometry", snapshot.version)
+        self.assertTrue(all(params["scope"] == scope for params in requested))
+
+    def test_candidate_download_rejects_changed_scope_revision(self):
+        scope = "astana_sale_pilot_v1"
+
+        def fake_get(url, **_kwargs):
+            if url.endswith("/meta"):
+                return _Response({"version": "v1", "scope": scope,
+                                  "scope_revision": "first", "listings_total": 1,
+                                  "photos_total": 0, "price_observations_total": 0,
+                                  "presence_events_total": 0})
+            return _Response({"version": "v1", "scope": scope,
+                              "scope_revision": "second", "total": 1,
+                              "rows": [collector_stub("1")]})
+
+        with mock.patch.object(collector_client, "COLLECTOR_URL", "https://collector"), \
+                mock.patch.object(collector_client, "COLLECTOR_CANDIDATE_SCOPE", scope), \
+                mock.patch.object(collector_client.requests, "get", side_effect=fake_get):
+            with self.assertRaisesRegex(collector_client.CollectorError, "changed scope"):
+                collector_client.fetch_candidate_snapshot()
+
     def test_candidate_download_pins_version_and_includes_source_histories(self):
         listing = collector_stub("1")
         price = {

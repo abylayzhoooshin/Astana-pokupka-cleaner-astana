@@ -5,7 +5,7 @@ services:
     name: rieltor-sales-cleaner-astana
     runtime: docker
     region: frankfurt
-    plan: starter
+    plan: standard
     numInstances: 1
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
@@ -22,6 +22,8 @@ services:
         value: https://rieltor-collector-pokupka.onrender.com
       - key: COLLECTOR_API_KEY
         sync: false
+      - key: COLLECTOR_CANDIDATE_SCOPE
+        value: astana_sale_pilot_v1
       - key: CLEANER_API_KEY
         generateValue: true
       - key: OPENAI_API_KEY
@@ -36,7 +38,7 @@ services:
       - key: MAX_BATCHES_PER_CYCLE
         value: "1"
       - key: PILOT_LIMIT
-        value: "0"
+        value: "100"
       - key: CLEANER_CYCLE_INTERVAL_H
         value: "12"
       - key: CLEANER_INGEST_TICK_S

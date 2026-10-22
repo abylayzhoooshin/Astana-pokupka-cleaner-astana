@@ -29,6 +29,7 @@ log = logging.getLogger("collector_client")
 
 COLLECTOR_URL = os.environ.get("COLLECTOR_URL", "").rstrip("/")
 COLLECTOR_API_KEY = os.environ.get("COLLECTOR_API_KEY", "")
+COLLECTOR_CANDIDATE_SCOPE = os.environ.get("COLLECTOR_CANDIDATE_SCOPE", "").strip()
 PAGE_SIZE = int(os.environ.get("COLLECTOR_PAGE_SIZE", "500"))  # = потолок коллектора
 
 # Это ключ для текстового вердикта Cleaner. Цена и фото не входят: при их
@@ -133,10 +134,14 @@ def _get_json(path, *, params=None, timeout=60):
 
 def fetch_candidate_meta():
     """Pin the immutable candidate version used by the entire download."""
-    meta = _get_json("/baseline/candidates/meta", timeout=20)
+    params = {"scope": COLLECTOR_CANDIDATE_SCOPE} if COLLECTOR_CANDIDATE_SCOPE else None
+    meta = _get_json("/baseline/candidates/meta", params=params, timeout=20)
     version = meta.get("version")
     if not isinstance(version, str) or not version:
         raise CollectorError("candidate meta has no valid version")
+    if COLLECTOR_CANDIDATE_SCOPE:
+        if meta.get("scope") != COLLECTOR_CANDIDATE_SCOPE or not meta.get("scope_revision"):
+            raise CollectorError("Collector returned a different or unversioned candidate scope")
     for field in (
         "listings_total", "photos_total", "price_observations_total",
         "presence_events_total",
@@ -147,14 +152,19 @@ def fetch_candidate_meta():
     return meta
 
 
-def _fetch_candidate_table(path, version, expected_total):
+def _fetch_candidate_table(path, version, expected_total, scope_revision=None):
     rows = []
     offset = 0
     while offset < expected_total:
-        data = _get_json(
-            path,
-            params={"version": version, "limit": PAGE_SIZE, "offset": offset},
-        )
+        params = {"version": version, "limit": PAGE_SIZE, "offset": offset}
+        if COLLECTOR_CANDIDATE_SCOPE:
+            params["scope"] = COLLECTOR_CANDIDATE_SCOPE
+        data = _get_json(path, params=params)
+        if COLLECTOR_CANDIDATE_SCOPE and (
+            data.get("scope") != COLLECTOR_CANDIDATE_SCOPE
+            or data.get("scope_revision") != scope_revision
+        ):
+            raise CollectorError(f"candidate endpoint {path} changed scope during download")
         if data.get("version") != version:
             raise CollectorError(
                 f"candidate endpoint {path} returned version {data.get('version')!r}, "
@@ -205,8 +215,9 @@ def fetch_candidate_snapshot():
     """
     meta = fetch_candidate_meta()
     version = meta["version"]
+    scope_revision = meta.get("scope_revision")
     rows = _fetch_candidate_table(
-        "/baseline/candidates/listings", version, meta["listings_total"]
+        "/baseline/candidates/listings", version, meta["listings_total"], scope_revision
     )
     _validate_snapshot_photos(rows)
     photo_total = sum(int(row.get("photo_count") or 0) for row in rows)
@@ -217,17 +228,19 @@ def fetch_candidate_snapshot():
         )
 
     prices = _fetch_candidate_table(
-        "/baseline/candidates/prices", version, meta["price_observations_total"]
+        "/baseline/candidates/prices", version, meta["price_observations_total"], scope_revision
     )
     presence = _fetch_candidate_table(
-        "/baseline/candidates/presence", version, meta["presence_events_total"]
+        "/baseline/candidates/presence", version, meta["presence_events_total"], scope_revision
     )
     listing_ids = {str(row["id"]) for row in rows}
     if len(listing_ids) != len(rows):
         raise CollectorError("candidate listings contain duplicate listing IDs")
     _validate_source_events(prices, listing_ids, "price history")
     _validate_source_events(presence, listing_ids, "presence history")
-    return CandidateSnapshot(version, meta, rows, prices, presence)
+    effective_version = (f"{version}:{COLLECTOR_CANDIDATE_SCOPE}:{scope_revision}"
+                         if COLLECTOR_CANDIDATE_SCOPE else version)
+    return CandidateSnapshot(effective_version, meta, rows, prices, presence)
 
 
 def fetch_meta():
