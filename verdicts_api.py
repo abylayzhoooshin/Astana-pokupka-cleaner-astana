@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import secrets
+import sqlite3
 import time
 from typing import Literal, Optional
 
@@ -135,6 +136,17 @@ def main_assessment(payload: MainAssessmentRequest):
         return result
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except sqlite3.OperationalError as exc:
+        if "locked" not in str(exc).lower():
+            raise
+        # The full Cleaner cycle is the only long-lived writer. Main keeps a
+        # durable outbox, so an explicit retry response is safe and avoids an
+        # ASGI traceback while the cycle owns SQLite's writer lock.
+        raise HTTPException(
+            status_code=503,
+            detail="Cleaner database is busy; retry delivery",
+            headers={"Retry-After": "10"},
+        ) from exc
 
 
 # ========================= чистый baseline =========================

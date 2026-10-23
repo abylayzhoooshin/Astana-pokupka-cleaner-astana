@@ -62,7 +62,11 @@ def _photo_report(value):
     for item in evidence:
         if not isinstance(item, dict) or set(item) != {"photo_ids", "observation"}:
             raise ValueError("invalid photo evidence")
-        if not isinstance(item["photo_ids"], list) or not 1 <= len(item["photo_ids"]) <= 10:
+        # Main validates every reference against photos actually sent to the
+        # model.  Some large albums legitimately support one observation with
+        # more than ten frames; the 16 KiB result limit above is the payload
+        # bound, so Cleaner must not impose a conflicting per-observation cap.
+        if not isinstance(item["photo_ids"], list) or not item["photo_ids"]:
             raise ValueError("invalid photo evidence ids")
         if not all(isinstance(pid, str) and len(pid) <= 80 for pid in item["photo_ids"]):
             raise ValueError("invalid photo evidence ids")
