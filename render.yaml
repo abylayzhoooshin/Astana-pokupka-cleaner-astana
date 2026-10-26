@@ -19,7 +19,7 @@ services:
       - key: PORT
         value: "8002"
       - key: COLLECTOR_URL
-        value: https://rieltor-collector-pokupka.onrender.com
+        value: https://rieltor-collector-pokupka-v2.onrender.com
       - key: COLLECTOR_API_KEY
         sync: false
       - key: COLLECTOR_CANDIDATE_SCOPE
