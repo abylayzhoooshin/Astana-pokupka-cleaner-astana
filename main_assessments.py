@@ -303,3 +303,31 @@ def enrich_rows(conn, rows):
         })
         enriched.append(copy)
     return enriched
+
+
+def export_photo_scores(conn, evaluator_version):
+    """Compact exact-revision scores, including listings no longer in clean baseline."""
+    version = _version(evaluator_version)
+    exported = []
+    rows = conn.execute(
+        """SELECT listing_id, photo_hash_key, result_json
+           FROM main_photo_assessments WHERE evaluator_version=?
+           ORDER BY listing_id, photo_hash_key""",
+        (version,),
+    )
+    for listing_id, photo_hash, raw in rows:
+        try:
+            result = json.loads(raw)
+            score = result.get("score")
+            if (result.get("status") not in {"ready", "ready_with_download_gaps"}
+                    or result.get("coverage") not in {"sufficient", "partial"}
+                    or type(score) not in (int, float) or not math.isfinite(score)
+                    or not 1 <= score <= 10 or not _PHOTO_HASH.fullmatch(photo_hash)):
+                continue
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        exported.append({
+            "id": listing_id, "photo_set_hash": photo_hash,
+            "interior_score": score, "interior_coverage": result["coverage"],
+        })
+    return exported

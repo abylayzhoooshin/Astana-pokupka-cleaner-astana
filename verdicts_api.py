@@ -149,6 +149,21 @@ def main_assessment(payload: MainAssessmentRequest):
         ) from exc
 
 
+@app.get("/main/photo-scores", dependencies=[Depends(require_write_api_key)])
+def main_photo_scores(version: str = Query(..., min_length=1, max_length=100)):
+    """All current-version photo scores for exact listing/photo revisions.
+
+    The reviewed pilot Main uses this compact export without consuming the
+    moving clean-price baseline or exposing assessment reports.
+    """
+    try:
+        with cleaner_db.connect() as conn:
+            rows = main_assessments.export_photo_scores(conn, version)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"evaluator_version": version, "rows": rows, "count": len(rows)}
+
+
 # ========================= чистый baseline =========================
 
 @app.get("/baseline/clean", dependencies=[Depends(require_api_key)])

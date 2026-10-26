@@ -400,6 +400,32 @@ class MainAssessmentTests(unittest.TestCase):
                     },
                 })
 
+    def test_photo_score_export_keeps_evaluated_listings_outside_clean_baseline(self):
+        version = main_assessments.DEFAULT_PHOTO_VERSION
+        with cleaner_db.connect() as conn:
+            main_assessments.save(conn, {
+                "listing_id": self.row["id"], "photo": {
+                    "photo_set_hash": self.row["photo_set_hash"],
+                    "evaluator_version": version,
+                    "result": {"status": "ready", "score": 6.2,
+                               "coverage": "sufficient"},
+                },
+            })
+            main_assessments.save(conn, {
+                "listing_id": "old", "photo": {
+                    "photo_set_hash": self.row["photo_set_hash"],
+                    "evaluator_version": "older-version",
+                    "result": {"status": "ready", "score": 8.0,
+                               "coverage": "partial"},
+                },
+            })
+            conn.commit()
+            rows = main_assessments.export_photo_scores(conn, version)
+        self.assertEqual([{
+            "id": "42", "photo_set_hash": self.row["photo_set_hash"],
+            "interior_score": 6.2, "interior_coverage": "sufficient",
+        }], rows)
+
 
 if __name__ == "__main__":
     unittest.main()
